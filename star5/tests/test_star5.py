@@ -1,11 +1,14 @@
 import asyncio
 import json
 import os
+import sqlite3
 import tempfile
 import time
 import unittest
 from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import HTMLResponse
@@ -13,7 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.testclient import TestClient
 
 import star5.web as web
-from star5 import effort, engines
+from star5 import effort, engines, steering
 from star5.runner import build_sources, detect_lang, normalize
 from star5.store import Store
 from star5.web import drop_event_logs, install
@@ -53,6 +56,16 @@ class Fakes:
         self.efforts = []
         self.fast_calls = []
         self.timeouts = []
+        self.chat_gate = None
+        self.fast_gate = None
+        self.steer_gate = None
+        self.report_gate = None
+        self.steer_calls = []
+        self.report_calls = []
+        self.steer_fails = False
+        self.steer_no_sources = False
+        self.capture_guidance = False
+        self.provider_messages = []
 
     async def brief(self, question, language, previous, config_path, extra=""):
         self.briefs.append({"question": question, "language": language, "previous": previous, "extra": extra})
@@ -94,6 +107,17 @@ class Fakes:
         await asyncio.sleep(0.15)
         if self.gate is not None:
             await self.gate.wait()
+        if self.capture_guidance:
+            from gpt_researcher.llm_provider.generic.base import GenericLLMProvider
+            captured = self.provider_messages
+
+            class Model:
+                async def ainvoke(self, messages, **kwargs):
+                    captured.append(messages)
+                    return AIMessage(content="ok")
+
+            await GenericLLMProvider(Model(), verbose=False).get_chat_response(
+                [{"role": "system", "content": "Return JSON"}, {"role": "user", "content": "Plan the search"}], False)
         await sink.send_json({"type": "report", "output": "# Titolo\n"})
         answer = "# Titolo\nVedi [WAL](https://www.sqlite.org/wal.html) e [blog](https://example.com/x)."
         Path("outputs").mkdir(exist_ok=True)
@@ -118,14 +142,40 @@ class Fakes:
         await sink.send_json({"type": "logs", "content": "added_source_url",
                               "output": "✅ Added source url to research: https://phimai.example/\n"})
         await sink.send_json({"type": "logs", "content": "writing_report", "output": "Writing"})
+        if self.fast_gate is not None:
+            await self.fast_gate.wait()
         await fake_model_call(400, 90)
         answer = "**Phimai** ([sito](https://phimai.example/))."
         return answer, [{"url": "https://phimai.example/", "title": "Phimai"}], ["https://phimai.example/"], {}
     async def chat(self, report, messages, config_path):
         self.chats.append({"report": report, "messages": messages})
         self.efforts.append(("chat", effort.current()))
+        if self.chat_gate is not None:
+            await self.chat_gate.wait()
         await fake_model_call(300, 50)
         return "Risposta dal rapporto.", [{"url": "https://brave.example/r", "title": "R"}]
+
+    async def steer(self, question, language, max_results, answer, sources, guidance, original_files, config_path, sink):
+        self.steer_calls.append({"question": question, "language": language, "max": max_results, "answer": answer,
+                                 "sources": sources, "guidance": guidance, "original_files": original_files})
+        self.efforts.append(("steer", effort.current()))
+        if self.steer_gate is not None:
+            await self.steer_gate.wait()
+        if self.steer_fails:
+            raise RuntimeError("revision unavailable")
+        await fake_model_call(100, 20)
+        url = f"https://steer.example/{len(self.steer_calls)}"
+        added = [] if self.steer_no_sources else [{"url": url, "title": "New source"}]
+        revised = answer + f"\n\nIndicazione: {guidance['query']}" + (f" [New]({url})." if added else "")
+        return revised, added, [url] if added else [], self.steer_no_sources
+
+    async def steer_report(self, answer, question):
+        self.report_calls.append({"answer": answer, "question": question})
+        if self.report_gate is not None:
+            await self.report_gate.wait()
+        path = Path(f"outputs/steered-{len(self.report_calls)}.md")
+        path.write_text(answer, encoding="utf-8")
+        return {"md": path.as_posix()}
 
 
 class Star5Case(unittest.TestCase):
@@ -170,7 +220,7 @@ class Star5Case(unittest.TestCase):
         self.runner = install(self.app, data_dir=Path(self.tmp.name) / "data", base_config=str(base),
                               research_fn=self.fakes.research, chat_fn=self.fakes.chat, brief_fn=self.fakes.brief,
                               media_fn=self.fakes.process_media, geocode_fn=self.fakes.geocode,
-                              fast_fn=self.fakes.fast)
+                              fast_fn=self.fakes.fast, steer_fn=self.fakes.steer, steer_report_fn=self.fakes.steer_report)
         self.uploads = self.app.state.star5_uploads
         self.data = Path(self.tmp.name) / "data"
         self.runner.tick_every = 0.02
@@ -219,6 +269,14 @@ class Star5Case(unittest.TestCase):
                 return state
             time.sleep(0.05)
         self.fail("upload not processed")
+
+    def wait_until(self, predicate, timeout=5):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return
+            time.sleep(0.02)
+        self.fail("condition not reached in time")
 
 
 class AttachmentTests(Star5Case):
@@ -371,6 +429,471 @@ class AttachmentTests(Star5Case):
         self.assertFalse((self.data / "uploads" / upload_id).exists())
         self.assertFalse(orphan.exists())
         self.assertEqual(self.client.get(f"/api/s5/uploads/{upload_id}").status_code, 404)
+
+
+class SteeringTests(Star5Case):
+    def running_research(self, **extra):
+        self.fakes.gate = asyncio.Event()
+        started = self.start("Confronta le soluzioni per SQLite", mode="quick", **extra)
+        self.wait_until(lambda: bool(self.fakes.calls))
+        return started
+
+    def send_steer(self, turn_id, message="", **extra):
+        return self.client.post(f"/api/s5/turns/{turn_id}/steering", headers=H,
+                                json={"message": message, **extra})
+
+    def test_running_research_sees_guidance_and_files_and_preserves_reports(self):
+        initial = self.upload(name="iniziale.txt", mime="text/plain")
+        self.wait_upload(initial)
+        self.fakes.capture_guidance = True
+        started = self.running_research(attachments=[initial])
+        added = self.upload(name="aggiunta.pdf", mime="application/pdf")
+        self.wait_upload(added)
+        response = self.send_steer(started["turn"], "Concentrati sul Belgio", attachments=[added],
+                                   location={"lat": 50.71712, "lon": 4.61234, "accuracy": 35, "label": "Wavre"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["steer"]["status"], "pending")
+        self.assertEqual(self.client.delete(f"/api/s5/uploads/{added}", headers=H).status_code, 409)
+        thread = self.client.get(f"/api/s5/threads/{started['thread']}").json()
+        self.assertEqual([a["id"] for a in thread["turns"][0]["attachments"]], [initial])
+        self.assertEqual([a["id"] for a in thread["turns"][0]["steering"][0]["attachments"]], [added])
+        self.client.portal.call(self.fakes.gate.set)
+        events = self.events(started["turn"])
+        done = events[-1]["turn"]
+        self.assertEqual(done["status"], "done")
+        self.assertEqual(done["steering"][0]["status"], "applied")
+        self.assertIn("Concentrati sul Belgio", self.fakes.provider_messages[0][-1]["content"])
+        self.assertIn("Contenuto di aggiunta.pdf", self.fakes.provider_messages[0][-1]["content"])
+        self.assertIn("Return JSON", self.fakes.provider_messages[0][0]["content"])
+        self.assertIn("Contenuto di aggiunta.pdf", self.fakes.steer_calls[0]["guidance"]["full"])
+        self.assertIn("Wavre", self.fakes.steer_calls[0]["guidance"]["full"])
+        self.assertIn("Contenuto di iniziale.txt", self.fakes.steer_calls[0]["original_files"])
+        self.assertEqual(list(self.fakes.calls[0]["docs"]), ["01-iniziale.txt.txt"])
+        self.assertIn("https://steer.example/1", done["answer"])
+        self.assertTrue(any(s["url"] == "https://steer.example/1" and s["cited"] for s in done["sources"]))
+        self.assertEqual((done["tokens_in"], done["tokens_out"], done["llm_calls"]), (3000, 460, 5))
+        self.assertIn("steering_revision", [e["t"] for e in events])
+        self.assertFalse(any(e["t"] == "chunk" for e in events), "the obsolete draft was streamed")
+        self.assertTrue(Path("outputs/t1.md").exists())
+        self.assertTrue(Path(done["files"]["md"]).exists())
+
+        chat = self.client.post(f"/api/s5/threads/{started['thread']}/turns", headers=H,
+                                json={"question": "Riepiloga", "kind": "chat"}).json()
+        self.events(chat["turn"])
+        content = self.fakes.chats[-1]["messages"][-1]["content"]
+        self.assertIn("Concentrati sul Belgio", content)
+        self.assertIn("Contenuto di aggiunta.pdf", content)
+        follow = self.client.post(f"/api/s5/threads/{started['thread']}/turns", headers=H,
+                                  json={"question": "E altri casi?", "kind": "research", "mode": "fast"}).json()
+        self.events(follow["turn"])
+        self.assertIn("Contenuto di aggiunta.pdf", self.fakes.fast_calls[-1]["earlier"])
+        follow = self.client.post(f"/api/s5/threads/{started['thread']}/turns", headers=H,
+                                  json={"question": "Un ultimo confronto", "kind": "research", "mode": "quick"}).json()
+        self.events(follow["turn"])
+        self.assertIn("Contenuto di aggiunta.pdf", self.fakes.briefs[-1]["previous"])
+        self.client.delete(f"/api/s5/threads/{started['thread']}", headers=H)
+        self.assertFalse(Path("outputs/t1.md").exists())
+        self.assertFalse(Path(done["files"]["md"]).exists())
+        self.assertFalse((self.data / "uploads" / added).exists())
+
+    def test_processing_files_and_multiple_messages_are_not_lost(self):
+        self.fakes.media_gate = asyncio.Event()
+        attachment = self.upload(name="nota.m4a", mime="audio/mp4")
+        started = self.running_research()
+        first = self.send_steer(started["turn"], "Considera questa nota", attachments=[attachment])
+        second = self.send_steer(started["turn"], "Rispondi in francese")
+        self.assertEqual((first.status_code, second.status_code), (200, 200))
+        self.client.portal.call(self.fakes.gate.set)
+        time.sleep(0.2)
+        self.assertEqual(self.fakes.steer_calls, [])
+        self.client.portal.call(self.fakes.media_gate.set)
+        done = self.events(started["turn"])[-1]["turn"]
+        self.assertEqual(done["status"], "done")
+        self.assertEqual([s["status"] for s in done["steering"]], ["applied", "applied"])
+        self.assertEqual(len(self.fakes.steer_calls), 1)
+        context = self.fakes.steer_calls[0]["guidance"]["full"]
+        self.assertLess(context.index("Considera questa nota"), context.index("Rispondi in francese"))
+        self.assertIn("Contenuto di nota.m4a", context)
+
+    def test_steer_arriving_during_revision_is_applied_in_another_pass(self):
+        self.fakes.steer_gate = asyncio.Event()
+        started = self.running_research()
+        self.assertEqual(self.send_steer(started["turn"], "Prima indicazione").status_code, 200)
+        self.client.portal.call(self.fakes.gate.set)
+        self.wait_until(lambda: len(self.fakes.steer_calls) == 1)
+        self.assertEqual(self.send_steer(started["turn"], "Poi confronta anche PostgreSQL").status_code, 200)
+        self.client.portal.call(self.fakes.steer_gate.set)
+        done = self.events(started["turn"])[-1]["turn"]
+        self.assertEqual(done["status"], "done")
+        self.assertEqual(len(self.fakes.steer_calls), 2)
+        self.assertEqual(self.fakes.steer_calls[1]["guidance"]["query"], "Poi confronta anche PostgreSQL")
+        self.assertIn("Prima indicazione", self.fakes.steer_calls[1]["answer"])
+        self.assertIn("Prima indicazione", self.fakes.steer_calls[1]["guidance"]["full"])
+        self.assertIn("Poi confronta anche PostgreSQL", done["answer"])
+        self.assertEqual([s["status"] for s in done["steering"]], ["applied", "applied"])
+        self.assertEqual(len(self.fakes.report_calls), 1, "only the final report should be generated")
+
+    def test_finalizing_refuses_new_guidance_without_binding_its_file(self):
+        self.fakes.report_gate = asyncio.Event()
+        started = self.running_research()
+        self.send_steer(started["turn"], "Aggiungi un confronto")
+        self.client.portal.call(self.fakes.gate.set)
+        self.wait_until(lambda: bool(self.fakes.report_calls))
+        attachment = self.upload(name="tardivo.txt", mime="text/plain")
+        self.wait_upload(attachment)
+        response = self.send_steer(started["turn"], "Ancora una cosa", attachments=[attachment])
+        self.assertEqual((response.status_code, response.json()["detail"]), (409, "steering_closed"))
+        self.assertIsNone(self.runner.store.upload(attachment)["turn_id"])
+        thread = self.client.get(f"/api/s5/threads/{started['thread']}").json()
+        self.assertFalse(thread["turns"][0]["steering_open"])
+        self.client.portal.call(self.fakes.report_gate.set)
+        self.assertEqual(self.events(started["turn"])[-1]["turn"]["status"], "done")
+
+    def test_attachment_error_is_visible_and_not_marked_applied(self):
+        self.fakes.media_gate = asyncio.Event()
+        self.fakes.media_fails = True
+        attachment = self.upload(name="rotto.pdf", mime="application/pdf")
+        started = self.running_research()
+        self.assertEqual(self.send_steer(started["turn"], "Leggi il file", attachments=[attachment]).status_code, 200)
+        self.client.portal.call(self.fakes.gate.set)
+        self.client.portal.call(self.fakes.media_gate.set)
+        done = self.events(started["turn"])[-1]["turn"]
+        self.assertEqual(done["status"], "done")
+        self.assertEqual((done["steering"][0]["status"], done["steering"][0]["error"]),
+                         ("error", "attachment_unreadable"))
+        self.assertEqual(self.fakes.steer_calls, [])
+        self.assertIn("sqlite.org", done["answer"])
+
+    def test_revision_failure_preserves_the_original_and_marks_the_error(self):
+        self.fakes.steer_fails = True
+        started = self.running_research()
+        self.send_steer(started["turn"], "Usa un altro criterio")
+        self.client.portal.call(self.fakes.gate.set)
+        done = self.events(started["turn"])[-1]["turn"]
+        self.assertEqual(done["status"], "error")
+        self.assertIn("revision unavailable", done["error"])
+        self.assertEqual((done["steering"][0]["status"], done["steering"][0]["error"]), ("error", "failed"))
+        self.assertIn("sqlite.org", done["answer"])
+        self.assertEqual(done["files"]["md"], "outputs/t1.md")
+
+    def test_missing_new_sources_is_reported(self):
+        self.fakes.steer_no_sources = True
+        started = self.running_research()
+        self.send_steer(started["turn"], "Aggiungi una verifica")
+        self.client.portal.call(self.fakes.gate.set)
+        done = self.events(started["turn"])[-1]["turn"]
+        self.assertEqual((done["steering"][0]["status"], done["steering"][0]["error"]), ("applied", "no_sources"))
+
+    def test_cancel_marks_pending_guidance_not_applied(self):
+        started = self.running_research()
+        self.send_steer(started["turn"], "Non perdermi")
+        self.assertTrue(self.client.post(f"/api/s5/turns/{started['turn']}/cancel", headers=H).json()["cancelled"])
+        done = self.events(started["turn"])[-1]["turn"]
+        self.assertEqual(done["status"], "cancelled")
+        self.assertEqual((done["steering"][0]["status"], done["steering"][0]["error"]), ("error", "cancelled"))
+
+    def test_cancel_before_the_job_starts_finishes_the_queued_turn(self):
+        thread = self.runner.store.create_thread("q")
+        turn = self.runner.store.add_turn(thread, kind="research", question="q", mode="quick", lang="it",
+                                          tone="Objective", max_results=8)
+
+        async def cancel_immediately():
+            job = self.runner.start(turn)
+            self.runner.store.add_steer(turn, "Do not lose this")
+            self.assertTrue(self.runner.cancel(turn))
+            await job.task
+            return job.done
+
+        self.assertTrue(self.client.portal.call(cancel_immediately))
+        done = self.runner.store.turn(turn)
+        self.assertEqual(done["status"], "cancelled")
+        self.assertEqual((done["steering"][0]["status"], done["steering"][0]["error"]), ("error", "cancelled"))
+
+    def test_cancel_during_final_report_does_not_mark_guidance_applied(self):
+        self.fakes.report_gate = asyncio.Event()
+        started = self.running_research()
+        self.send_steer(started["turn"], "Aggiungi un confronto")
+        self.client.portal.call(self.fakes.gate.set)
+        self.wait_until(lambda: bool(self.fakes.report_calls))
+        self.assertTrue(self.client.post(f"/api/s5/turns/{started['turn']}/cancel", headers=H).json()["cancelled"])
+        done = self.events(started["turn"])[-1]["turn"]
+        self.assertEqual(done["status"], "cancelled")
+        self.assertEqual((done["steering"][0]["status"], done["steering"][0]["error"]), ("error", "cancelled"))
+        self.assertIn("sqlite.org", done["answer"])
+
+    def test_validation_binding_and_file_only_direction(self):
+        attachment = self.upload(name="solo.txt", mime="text/plain")
+        self.wait_upload(attachment)
+        started = self.running_research()
+        url = f"/api/s5/turns/{started['turn']}/steering"
+        self.assertEqual(self.client.post(url, json={"message": "x"}).status_code, 403)
+        self.assertEqual(self.send_steer(started["turn"]).status_code, 400)
+        self.assertEqual(self.send_steer(started["turn"], "x" * 2001).status_code, 400)
+        self.assertEqual(self.send_steer(started["turn"], "x", attachments=[attachment, attachment]).status_code, 400)
+        self.assertEqual(self.send_steer(started["turn"], "x", attachments=[attachment, "0" * 16]).status_code, 409)
+        self.assertIsNone(self.runner.store.upload(attachment)["turn_id"], "binding must roll back on failure")
+        self.assertEqual(self.send_steer("0" * 16, "x").status_code, 404)
+        self.assertEqual(self.send_steer(started["turn"], attachments=[attachment]).status_code, 200)
+        self.assertEqual(self.send_steer(started["turn"], "reuse", attachments=[attachment]).status_code, 409)
+        self.client.portal.call(self.fakes.gate.set)
+        done = self.events(started["turn"])[-1]["turn"]
+        self.assertEqual(done["steering"][0]["status"], "applied")
+        self.assertIn("Contenuto di solo.txt", self.fakes.steer_calls[0]["guidance"]["full"])
+        self.assertEqual(self.send_steer(started["turn"], "too late").status_code, 409)
+
+    def test_fast_mode_steering_uses_same_reasoning_and_adds_sources(self):
+        self.fakes.fast_gate = asyncio.Event()
+        started = self.start("Una ricerca veloce", mode="fast")
+        self.wait_until(lambda: bool(self.fakes.fast_calls))
+        attachment = self.upload(name="immagine.jpg", mime="image/jpeg")
+        self.wait_upload(attachment)
+        self.assertEqual(self.send_steer(started["turn"], "Cerca in Belgio", attachments=[attachment]).status_code, 200)
+        self.client.portal.call(self.fakes.fast_gate.set)
+        done = self.events(started["turn"])[-1]["turn"]
+        self.assertEqual(done["status"], "done")
+        self.assertEqual(done["steering"][0]["status"], "applied")
+        self.assertIn(("steer", "low"), self.fakes.efforts)
+        self.assertIn("Contenuto di immagine.jpg", self.fakes.steer_calls[0]["guidance"]["full"])
+        self.assertTrue(any(s["url"] == "https://steer.example/1" for s in done["sources"]))
+
+    def test_deep_research_also_integrates_guidance(self):
+        self.fakes.gate = asyncio.Event()
+        started = self.start("Una ricerca approfondita", mode="deep")
+        self.wait_until(lambda: bool(self.fakes.calls))
+        self.assertEqual(self.send_steer(started["turn"], "Confronta anche i limiti").status_code, 200)
+        self.client.portal.call(self.fakes.gate.set)
+        done = self.events(started["turn"])[-1]["turn"]
+        self.assertEqual((done["mode"], done["status"], done["steering"][0]["status"]), ("deep", "done", "applied"))
+        self.assertIn("Confronta anche i limiti", self.fakes.steer_calls[0]["guidance"]["full"])
+
+    def test_queued_research_accepts_guidance(self):
+        first = self.running_research()
+        second = self.start("Una seconda ricerca", mode="quick")
+        self.assertEqual(self.runner.store.turn(second["turn"])["status"], "queued")
+        self.assertEqual(self.send_steer(second["turn"], "Solo informazioni ufficiali").status_code, 200)
+        self.client.portal.call(self.fakes.gate.set)
+        self.events(first["turn"])
+        done = self.events(second["turn"])[-1]["turn"]
+        self.assertEqual(done["status"], "done")
+        self.assertEqual(done["steering"][0]["status"], "applied")
+        self.assertIn("Solo informazioni ufficiali", self.fakes.steer_calls[-1]["guidance"]["full"])
+
+    def test_steering_a_chat_keeps_the_report_and_attachment(self):
+        started = self.start()
+        self.events(started["turn"])
+        self.fakes.chat_gate = asyncio.Event()
+        chat = self.client.post(f"/api/s5/threads/{started['thread']}/turns", headers=H,
+                                json={"question": "E PostgreSQL?", "kind": "chat"}).json()
+        self.wait_until(lambda: len(self.fakes.chats) == 1)
+        attachment = self.upload(name="nota.txt", mime="text/plain")
+        self.wait_upload(attachment)
+        self.assertEqual(self.send_steer(chat["turn"], "Rispondi in francese", attachments=[attachment]).status_code, 200)
+        self.client.portal.call(self.fakes.chat_gate.set)
+        done = self.events(chat["turn"])[-1]["turn"]
+        self.assertEqual(done["status"], "done")
+        self.assertEqual(done["steering"][0]["status"], "applied")
+        self.assertEqual(len(self.fakes.chats), 2)
+        self.assertIn("sqlite.org", self.fakes.chats[-1]["report"])
+        self.assertIn("Rispondi in francese", self.fakes.chats[-1]["messages"][-1]["content"])
+        self.assertIn("Contenuto di nota.txt", self.fakes.chats[-1]["messages"][-1]["content"])
+        self.assertIn("unless the latest directions request another language",
+                      self.fakes.chats[-1]["messages"][-1]["content"])
+        self.assertEqual(self.fakes.report_calls, [])
+
+    def test_follow_up_chat_keeps_excerpts_from_all_large_files(self):
+        started = self.running_research()
+        earlier = [self.upload(name=f"earlier-{n}.txt", mime="text/plain") for n in ("A", "B")]
+        for n, upload_id in zip(("A", "B"), earlier):
+            self.wait_upload(upload_id)
+            (self.uploads.dir(upload_id) / "derived.txt").write_text(f"EARLIER-{n}-" + "x" * 50000)
+        self.send_steer(started["turn"], "Leggi entrambi", attachments=earlier)
+        self.client.portal.call(self.fakes.gate.set)
+        self.events(started["turn"])
+
+        current = [self.upload(name=f"current-{n}.txt", mime="text/plain") for n in ("A", "B")]
+        for n, upload_id in zip(("A", "B"), current):
+            self.wait_upload(upload_id)
+            (self.uploads.dir(upload_id) / "derived.txt").write_text(f"CURRENT-{n}-" + "y" * 50000)
+        chat = self.client.post(f"/api/s5/threads/{started['thread']}/turns", headers=H,
+                                json={"question": "Confrontali", "kind": "chat", "attachments": current}).json()
+        self.assertEqual(self.events(chat["turn"])[-1]["turn"]["status"], "done")
+        content = self.fakes.chats[-1]["messages"][-1]["content"]
+        for marker in ("EARLIER-A-", "EARLIER-B-", "CURRENT-A-", "CURRENT-B-"):
+            self.assertIn(marker, content)
+        self.assertGreaterEqual(content.count("[Attachment content truncated.]"), 4)
+
+
+class SteeringUnitTests(unittest.TestCase):
+    def test_model_hook_keeps_concurrent_turns_isolated(self):
+        from gpt_researcher.llm_provider.generic.base import GenericLLMProvider
+        steering.install()
+        captured = {}
+        original = [{"role": "system", "content": "Return JSON"}, {"role": "user", "content": "Plan"}]
+
+        class Controller:
+            def __init__(self, value):
+                self.value = value
+
+            async def prompt(self):
+                await asyncio.sleep(0)
+                return self.value
+
+        class Model:
+            def __init__(self, key):
+                self.key = key
+
+            async def ainvoke(self, messages, **kwargs):
+                captured[self.key] = messages
+                return AIMessage(content="ok")
+
+        async def invoke(key, controller):
+            with steering.guided(controller):
+                return await GenericLLMProvider(Model(key), verbose=False).get_chat_response(original, False)
+
+        async def run():
+            return await asyncio.gather(invoke("a", Controller("direction A")),
+                                        invoke("b", Controller("direction B")), invoke("none", None))
+
+        self.assertEqual(asyncio.run(run()), ["ok", "ok", "ok"])
+        self.assertEqual(original[-1]["content"], "Plan")
+        self.assertIn("direction A", captured["a"][-1]["content"])
+        self.assertNotIn("direction B", captured["a"][-1]["content"])
+        self.assertIn("direction B", captured["b"][-1]["content"])
+        self.assertEqual(captured["none"], original)
+        self.assertIn("required output format", captured["a"][-1]["content"])
+
+    def test_research_revision_searches_new_directions_and_reports_missing_sources(self):
+        calls = {}
+        guidance = {"query": "New direction", "short": "Short file text", "full": "Full file text"}
+
+        class Sink:
+            async def send_json(self, event):
+                calls["event"] = event
+
+        async def gather(question, earlier, extra, max_results, config, sink, *, planner, allow_empty):
+            calls["gather"] = (question, earlier, extra, max_results, config, planner, allow_empty)
+            return [], []
+
+        async def writer(question, language, answer, sources, instructions, results, original_files, config):
+            calls["writer"] = (question, language, answer, sources, instructions, results, original_files, config)
+            return "Updated answer"
+
+        result = asyncio.run(steering.refine_research(
+            "Original", "italian", 8, "Earlier answer", [{"url": "https://old.example/", "title": "Old"}],
+            guidance, "Original file", "cfg", Sink(), gather=gather, writer=writer))
+        self.assertEqual(result, ("Updated answer", [], [], True))
+        self.assertEqual(calls["gather"],
+                         ("New direction", "Original", "Short file text", 8, "cfg", steering.plan_steering_queries, True))
+        self.assertEqual(calls["writer"][3][0]["url"], "https://old.example/")
+        self.assertEqual(calls["writer"][4]["full"], "Full file text")
+        self.assertEqual(calls["writer"][6], "Original file")
+        self.assertEqual(calls["event"]["content"], "writing_report")
+
+    def test_rewrite_prompt_receives_both_reports_files_and_real_sources(self):
+        cfg = SimpleNamespace(smart_llm_model="frontier", smart_llm_provider="openai", llm_kwargs={},
+                              smart_token_limit=24000)
+        completion = AsyncMock(return_value="Updated")
+        results = [{"url": "https://new.example/", "title": "New", "age": "", "snippet": "Evidence", "text": ""}]
+        with patch("gpt_researcher.config.Config", return_value=cfg), \
+                patch("gpt_researcher.utils.llm.create_chat_completion", completion):
+            answer = asyncio.run(steering.write_refined_report(
+                "Original question", "french", "Original report", [{"url": "https://old.example/", "title": "Old"}],
+                {"full": "Direction and attachment"}, results, "Original document", "cfg"))
+        self.assertEqual(answer, "Updated")
+        request = completion.await_args.kwargs
+        self.assertEqual(request["model"], "frontier")
+        self.assertEqual(request["max_tokens"], 24000)
+        system, user = request["messages"]
+        self.assertIn("in french", system["content"])
+        self.assertIn("unless the latest", system["content"])
+        self.assertIn("never invent citations", system["content"])
+        for expected in ("Original report", "https://old.example/", "Direction and attachment",
+                         "Original document", "https://new.example/"):
+            self.assertIn(expected, user["content"])
+
+    def test_truncated_revised_answer_is_not_marked_successful(self):
+        from gpt_researcher.llm_provider.generic.base import GenericLLMProvider
+        steering.install()
+        cfg = SimpleNamespace(smart_llm_model="frontier", smart_llm_provider="openai", llm_kwargs={},
+                              smart_token_limit=24000)
+
+        class Model:
+            async def ainvoke(self, messages, **kwargs):
+                return AIMessage(content="A partial answer", response_metadata={"finish_reason": "length"})
+
+        async def completion(**kwargs):
+            return await GenericLLMProvider(Model(), verbose=False).get_chat_response(kwargs["messages"], False)
+
+        with patch("gpt_researcher.config.Config", return_value=cfg), \
+                patch("gpt_researcher.utils.llm.create_chat_completion", completion):
+            with self.assertRaisesRegex(RuntimeError, "truncated"):
+                asyncio.run(steering.write_refined_report(
+                    "q", "italian", "old answer", [], {"full": "direction"}, [], "", "cfg"))
+
+    def test_restart_marks_accepted_unfinished_guidance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "test.db")
+            thread = store.create_thread("q")
+            turn = store.add_turn(thread, kind="research", question="q", mode="quick", lang="it",
+                                  tone="Objective", max_results=8)
+            store.add_steer(turn, "new direction")
+            self.assertEqual(store.fail_interrupted(), 1)
+            saved = store.turn(turn)
+        self.assertEqual(saved["status"], "error")
+        self.assertEqual((saved["steering"][0]["status"], saved["steering"][0]["error"]),
+                         ("error", "interrupted"))
+
+    def test_all_attached_files_get_a_fair_excerpt_with_explicit_truncation(self):
+        class Uploads:
+            def text(self, upload_id):
+                return f"FILE-{upload_id}-" + "x" * 40000
+
+        attachments = [{"id": str(i), "name": f"{i}.txt", "kind": "document"} for i in range(20)]
+        records = [{"status": "ready", "message": "Read these", "location": None, "attachments": attachments}]
+        for full, limit in ((False, 12000), (True, 60000)):
+            text = steering.describe(records, Uploads(), full=full)
+            for attachment in attachments:
+                self.assertIn(f"FILE-{attachment['id']}-", text)
+            self.assertEqual(text.count("[Attachment content truncated.]"), 20)
+            self.assertLess(len(text), limit + 2000)
+
+    def test_search_planner_gets_more_of_the_latest_attachment_context(self):
+        plan = AsyncMock(return_value=["query"])
+        with patch("star5.steering.fast.plan_queries", plan):
+            result = asyncio.run(steering.plan_steering_queries("new", "old", "context", "cfg"))
+        self.assertEqual(result, ["query"])
+        plan.assert_awaited_once_with("new", "old", "context", "cfg", extra_limit=16000)
+
+    def test_final_answer_and_applied_updates_roll_back_together(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "test.db")
+            thread = store.create_thread("q")
+            turn = store.add_turn(thread, kind="research", question="q", mode="quick", lang="it",
+                                  tone="Objective", max_results=8)
+            steer_id = store.add_steer(turn, "new direction")
+            store.update_steer(steer_id, status="applying")
+            with self.assertRaisesRegex(RuntimeError, "Cannot finalize"):
+                store.finish_turn(turn, "done", [steer_id, "missing"], {}, answer="partial", finished=time.time())
+            saved = store.turn(turn)
+        self.assertEqual(saved["status"], "queued")
+        self.assertEqual(saved["answer"], "")
+        self.assertEqual(saved["steering"][0]["status"], "applying")
+
+    def test_restart_recovery_rolls_back_both_updates_on_database_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "test.db")
+            thread = store.create_thread("q")
+            turn = store.add_turn(thread, kind="research", question="q", mode="quick", lang="it",
+                                  tone="Objective", max_results=8)
+            store.add_steer(turn, "new direction")
+            with store.connect() as conn:
+                conn.execute("CREATE TRIGGER fail_turn BEFORE UPDATE ON turns "
+                             "BEGIN SELECT RAISE(FAIL, 'test failure'); END")
+            with self.assertRaises(sqlite3.IntegrityError):
+                store.fail_interrupted()
+            saved = store.turn(turn)
+        self.assertEqual(saved["status"], "queued")
+        self.assertEqual(saved["steering"][0]["status"], "pending")
 
 
 class MediaTests(unittest.TestCase):
@@ -648,6 +1171,15 @@ class FastPipelineTests(unittest.TestCase):
     def test_no_results_fail_clearly(self):
         with self.assertRaisesRegex(RuntimeError, "no results"):
             self.run_fast(search=lambda query, count: [])
+
+    def test_steering_search_can_continue_without_new_sources(self):
+        async def planner(question, earlier, extra, config):
+            return ["no results"]
+
+        result = asyncio.run(self.fast.gather_sources(
+            "q", "", "", 8, "cfg", self.Sink(self.events), planner=planner,
+            search=lambda query, count: [], allow_empty=True))
+        self.assertEqual(result, ([], []))
 
     def test_query_helpers(self):
         fast = self.fast

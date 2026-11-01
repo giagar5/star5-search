@@ -401,16 +401,32 @@ def location_text(location):
             f"\"near me\" or \"here\".")
 
 
+def attachment_excerpts(uploads, read_text, per_item=2500, total=12000):
+    """Share the text budget among all files instead of dropping later attachments."""
+    remaining = total
+    for index, upload in enumerate(uploads):
+        text = read_text(upload["id"])
+        if not text:
+            LOG.warning("No readable content for attachment %s", upload["id"])
+            yield upload, "[Attachment content unavailable.]"
+            continue
+        room = max(0, min(per_item, remaining // (len(uploads) - index)))
+        excerpt = text[:room]
+        remaining -= len(excerpt)
+        if len(text) > room:
+            excerpt += "\n[Attachment content truncated.]"
+        yield upload, excerpt
+
+
 def attachment_context(uploads, read_text, per_item=2500, total=12000):
     """Short excerpt of every attachment, for the research brief and the planner."""
-    parts, used = [], 0
+    parts = []
+    ready = [upload for upload in uploads if upload["state"] == "ready"]
+    excerpts = iter(attachment_excerpts(ready, read_text, per_item=per_item, total=total))
     for upload in uploads:
         if upload["state"] != "ready":
             parts.append(f"- {upload['kind']} \"{upload['name']}\": could not be read ({upload['error'] or 'error'}).")
             continue
-        text = read_text(upload["id"])
-        room = max(0, min(per_item, total - used))
-        excerpt = text[:room] + ("…" if len(text) > room else "")
-        used += len(excerpt)
+        _, excerpt = next(excerpts)
         parts.append(f"- {upload['kind']} \"{upload['name']}\":\n{excerpt}")
     return "Files attached by the user (their content, as text):\n" + "\n".join(parts) if parts else ""

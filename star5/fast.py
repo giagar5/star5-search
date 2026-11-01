@@ -85,7 +85,7 @@ def parse_queries(text, question):
     return queries[:MAX_QUERIES] or [short_query(question)]
 
 
-async def plan_queries(question, earlier, extra, config_path):
+async def plan_queries(question, earlier, extra, config_path, *, extra_limit=3000):
     from gpt_researcher.config import Config
     from gpt_researcher.utils.llm import create_chat_completion
 
@@ -94,7 +94,7 @@ async def plan_queries(question, earlier, extra, config_path):
     if earlier:
         user += f"\n\nEarlier question in this conversation: {earlier}"
     if extra:
-        user += f"\n\n{extra[:3000]}"
+        user += f"\n\n{extra[:extra_limit]}"
     try:
         # No reasoning for the planner: 2-3 short queries do not need it (gpt-6-luna accepts "none").
         with reasoning(""):
@@ -237,9 +237,9 @@ def interleave(lists):
     return merged
 
 
-async def fast_research(question, language, earlier, extra, files_text, location, max_results, config_path, sink, *,
-                        planner=plan_queries, writer=write_answer, files_fn=report_files, transport=None,
-                        guard=_guard_request, search=engines.search_all):
+async def gather_sources(question, earlier, extra, max_results, config_path, sink, *,
+                         planner=plan_queries, transport=None, guard=_guard_request,
+                         search=engines.search_all, allow_empty=False):
     queries = await planner(question, earlier, extra, config_path)
     await log(sink, "subqueries", "Search plan: " + " | ".join(queries), metadata=queries)
     for query in queries:
@@ -248,6 +248,8 @@ async def fast_research(question, language, earlier, extra, files_text, location
     lists = await asyncio.gather(*(asyncio.to_thread(search, q, max_results) for q in queries))
     results = interleave(lists)[:LISTED_RESULTS]
     if not results:
+        if allow_empty:
+            return [], []
         raise RuntimeError("The web search returned no results")
     active = engines.current()
     if active:
@@ -271,6 +273,14 @@ async def fast_research(question, language, earlier, extra, files_text, location
         read = read[:target]
     for item in read:
         await log(sink, "added_source_url", f"✅ Added source url to research: {item['url']}\n")
+    return results, [r["url"] for r in read]
+
+
+async def fast_research(question, language, earlier, extra, files_text, location, max_results, config_path, sink, *,
+                        planner=plan_queries, writer=write_answer, files_fn=report_files, transport=None,
+                        guard=_guard_request, search=engines.search_all):
+    results, visited = await gather_sources(question, earlier, extra, max_results, config_path, sink,
+                                            planner=planner, transport=transport, guard=guard, search=search)
     await log(sink, "writing_report", "Writing the answer")
     answer = str(await writer(question, language, earlier, files_text, location, results, config_path)).strip()
     if not answer:
@@ -282,4 +292,4 @@ async def fast_research(question, language, earlier, extra, files_text, location
         LOG.exception("Veloce: report files failed")
         files = {}
     sources = [{"url": r["url"], "title": r["title"]} for r in results]
-    return answer, sources, [r["url"] for r in read], files
+    return answer, sources, visited, files

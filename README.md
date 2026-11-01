@@ -43,6 +43,12 @@ your own server behind your own login. Your questions, history and files stay wi
 - **Conversations.** Ask follow-ups on the report ("from the report") or start a new web
   search with the previous context. The history is always visible: the latest searches are
   on the home page and the full history is in the sidebar, the same on every device.
+- **Guide a running answer.** Use "Guide this answer" to add directions, files or a
+  location while a search or report chat is running. Directions can change the scope or
+  answer language; later ones take precedence. Research may search the web again and
+  rewrite the answer, taking extra time and tokens. The UI shows whether each direction
+  was applied or failed; if the answer is already being finalized, the unsent draft and
+  files remain available for a follow-up.
 - **Attachments.**
   - Photos, including HEIC: the vision model reads visible text, brands and places.
   - Audio and voice recordings: transcribed locally with Whisper.
@@ -50,6 +56,9 @@ your own server behind your own login. Your questions, history and files stay wi
   - Documents: PDF (OCR when scanned), Word, PowerPoint, Excel, EPUB, HTML and text.
 
   You can ask "where can I buy this?" with a photo, or "is this quote fair?" with a PDF.
+  Up to 10 files can be attached to each direction. Large extracted texts are shared
+  fairly within the model's context budget and explicitly marked when truncated; queries
+  derived from them may be sent to the configured external search providers.
 - **Your location, on request.** GPS is used only for the question you attach it to. It is
   rounded to about 100 m before reverse geocoding, so "near me" means near you.
 - **Your choice of reasoning.** Pick automatic, low, medium, high, very high or maximum.

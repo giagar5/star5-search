@@ -119,6 +119,13 @@
         <button type="button" class="to-bottom" id="toBottom" data-i18n-title="toBottom" hidden>
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M6 13l6 6 6-6"/></svg>
         </button>
+        <div id="steerTarget" class="steer-target" hidden>
+          <span id="steerTargetText"></span>
+          <button type="button" class="steer-exit" id="steerExit" data-i18n-title="steerExit">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 7l10 10M17 7L7 17"/></svg>
+          </button>
+        </div>
+        <p id="steerHint" class="steer-hint" data-i18n="steerHint" hidden></p>
         <label class="sr" for="fq" data-i18n="followPh"></label>
         <textarea id="fq" rows="1" maxlength="2000" data-i18n-ph="followPh" required></textarea>
         <div class="attach-list" hidden></div>
@@ -169,13 +176,18 @@
     <h2 class="q"></h2>
     <div class="meta"></div>
     <div class="att-row" hidden></div>
+    <div class="steering-list" aria-live="polite" hidden></div>
     <details class="brief" hidden><summary data-i18n="brief"></summary><p></p></details>
     <div class="progress" hidden>
       <ol class="steps"></ol>
       <ul class="queries" hidden></ul>
+      <p class="steering-live" role="status" hidden></p>
       <div class="prog-foot">
         <span class="elapsed"></span>
-        <button type="button" class="link-btn cancel" data-i18n="cancel"></button>
+        <div class="prog-controls">
+          <button type="button" class="link-btn guide" data-i18n="steerGuide"></button>
+          <button type="button" class="link-btn cancel" data-i18n="cancel"></button>
+        </div>
       </div>
       <details class="log" hidden><summary data-i18n="details"></summary><ol></ol></details>
     </div>

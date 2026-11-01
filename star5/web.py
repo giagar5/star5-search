@@ -27,6 +27,7 @@ from . import engines
 from .fast import fast_research
 from .media import Geocoder, process as process_media
 from .runner import LANGS, MODES, MAX_QUESTION, TONES, UI_LANGS, Runner, detect_lang, language_configs
+from .steering import install as install_steering, refine_research, report_files as steered_report_files
 from .store import Store
 from .uploads import Uploads, clean_location
 
@@ -186,10 +187,12 @@ def effort_option(body):
 
 
 def install(app: FastAPI, *, data_dir=None, base_config=None, research_fn=research, chat_fn=chat, brief_fn=brief,
-            media_fn=process_media, geocode_fn=None, fast_fn=fast_research):
+            media_fn=process_media, geocode_fn=None, fast_fn=fast_research, steer_fn=refine_research,
+            steer_report_fn=steered_report_files):
     data_dir = Path(data_dir or os.environ.get("STAR5_DATA", "data"))
     base_config = base_config or os.environ.get("CONFIG_PATH")
     install_effort()
+    install_steering()
     engines.install_gpt_researcher()
     configs = language_configs(base_config, data_dir / "configs")
     default_results = json.loads(Path(base_config).read_text(encoding="utf-8")).get("MAX_SEARCH_RESULTS_PER_QUERY", 8)
@@ -201,7 +204,7 @@ def install(app: FastAPI, *, data_dir=None, base_config=None, research_fn=resear
     docs_root = data_dir / "turn-docs"
     shutil.rmtree(docs_root, ignore_errors=True)
     runner = Runner(store, research_fn, chat_fn, configs, brief_fn=brief_fn, uploads=uploads, docs_root=docs_root,
-                    fast_fn=fast_fn)
+                    fast_fn=fast_fn, steer_fn=steer_fn, steer_report_fn=steer_report_fn)
     router = APIRouter(prefix="/api/s5")
 
     def guard(request: Request):
@@ -268,6 +271,9 @@ def install(app: FastAPI, *, data_dir=None, base_config=None, research_fn=resear
         found = store.thread(thread_id)
         if found is None:
             raise HTTPException(404, "thread")
+        for turn in found["turns"]:
+            job = runner.jobs.get(turn["id"])
+            turn["steering_open"] = bool(job and not job.done and job.accepting_steering)
         return found
 
     @router.post("/threads/{thread_id}/turns")
@@ -306,6 +312,38 @@ def install(app: FastAPI, *, data_dir=None, base_config=None, research_fn=resear
     async def cancel(turn_id: str, request: Request):
         guard(request)
         return {"cancelled": runner.cancel(turn_id)}
+
+    @router.post("/turns/{turn_id}/steering")
+    async def steer(turn_id: str, request: Request):
+        guard(request)
+        body = await body_of(request)
+        attachments, location = extras(body)
+        message = body.get("message", "")
+        if not isinstance(message, str):
+            raise HTTPException(400, "message")
+        if message.strip():
+            message = clean_question(message)
+        elif attachments or location:
+            message = ""
+        else:
+            raise HTTPException(400, "message")
+        if store.turn(turn_id) is None:
+            raise HTTPException(404, "turn")
+        job = runner.jobs.get(turn_id)
+        if job is None or job.done or not job.accepting_steering:
+            raise HTTPException(409, "steering_closed")
+        try:
+            steer_id = store.add_steer(turn_id, message, attachments, location)
+        except KeyError:
+            raise HTTPException(404, "turn")
+        except ValueError:
+            raise HTTPException(409, "attachments")
+        except RuntimeError:
+            raise HTTPException(409, "steering_closed")
+        job.suppress_chunks = True
+        record = next(s for s in store.steers(turn_id) if s["id"] == steer_id)
+        await job.emit({"t": "steer", "steer": record})
+        return {"steer": record}
 
     @router.get("/turns/{turn_id}/events")
     async def events(turn_id: str, request: Request, after: int = 0):

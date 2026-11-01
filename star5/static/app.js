@@ -40,6 +40,7 @@
     effort: store.get("s5.effort", ""),
     sites: Number(store.get("s5.sites", "0")) || 8,
     threads: [], thread: null, streams: new Map(), live: new Map(), timers: new Set(), expired: false, libLimit: 8,
+    steerTarget: null, followSending: false,
   };
   if (state.mode === "detailed") state.mode = "deep";
   if (!MODES.includes(state.mode)) state.mode = "fast";
@@ -107,7 +108,8 @@
     buildSeg($("#fmodes"), MODES, state.mode, modeLabel, pick, MODE_ICON);
     buildSeg($("#kinds"), ["chat", "research"], state.kind, k => T.kinds[k],
       k => { state.kind = k; store.set("s5.kind", k); renderModes(); }, {chat: "book", research: "globe"});
-    $("#fmodes").hidden = state.kind !== "research";
+    $("#kinds").hidden = !!state.steerTarget;
+    $("#fmodes").hidden = !!state.steerTarget || state.kind !== "research";
     $("#fmodes").title = T.modeHints[state.mode];
     hint();
   }
@@ -221,6 +223,7 @@
   }
   async function route() {
     const match = location.hash.match(/^#\/t\/([a-f0-9]{16})$/);
+    if (!match || state.thread?.id !== match[1]) state.steerTarget = null;
     closeStreams();
     if (!match) {
       state.thread = null; show("home"); renderLibrary(); renderRecent();
@@ -241,6 +244,7 @@
   function renderThread() {
     const root = $("#turns");
     root.replaceChildren(...state.thread.turns.map((t, i) => renderTurn(t, i === 0)));
+    renderFollowMode();
     renderTotal();
     scheduleRail();
   }
@@ -423,7 +427,8 @@
 
   /* ---------- a turn: question, progress, sources, answer, actions ---------- */
   function liveOf(id) {
-    if (!state.live.has(id)) state.live.set(id, {phase: null, queries: [], current: null, sources: [], text: "", logs: [], seq: 0});
+    if (!state.live.has(id)) state.live.set(id, {phase: null, queries: [], current: null, sources: [], text: "", logs: [], seq: 0,
+      steering: false, finalizing: false, steerFiles: null});
     return state.live.get(id);
   }
   function renderTurn(turn, first) {
@@ -454,6 +459,7 @@
     }
     const brief = $(".brief", node), briefText = turn.brief || live.brief || "";
     renderAttachments($(".att-row", node), turn);
+    renderSteering($(".steering-list", node), turn, live);
     brief.hidden = !briefText;
     $("p", brief).textContent = briefText;
 
@@ -469,6 +475,26 @@
     if (!failed.hidden) failed.textContent = turn.status === "cancelled" ? T.status.cancelled
       : turn.error === "interrupted" ? T.interrupted : `${T.failed} ${turn.error || ""}`.trim();
     renderActions(node, turn, first, running);
+  }
+  function renderSteering(box, turn, live) {
+    box.replaceChildren();
+    (turn.steering || []).forEach(record => {
+      const item = el("div", "steer-msg"), head = el("div", "steer-head");
+      let key = record.status === "error" ? record.error || "failed"
+        : record.status === "applied" && record.error === "no_sources" ? "no_sources" : record.status;
+      let status = T.steerStatus[key] || T.steerStatus.failed;
+      if (record.status === "pending" && live.steerFiles?.id === record.id) {
+        status = `${T.processingAtt} ${live.steerFiles.done}/${live.steerFiles.total}`;
+      }
+      const stateClass = record.status === "error" ? "error" : key === "no_sources" ? "warning" : "";
+      head.append(el("span", "", T.steerLabel), el("span", `steer-status ${stateClass}`, status));
+      item.append(head);
+      if (record.message) item.append(el("p", "steer-text", record.message));
+      const files = el("div", "att-row");
+      renderAttachments(files, record);
+      item.append(files); box.append(item);
+    });
+    box.hidden = !box.childElementCount;
   }
   function duration(s) { s = Math.max(0, Math.round(s)); return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s`; }
   const compact = n => new Intl.NumberFormat(state.ui, {notation: "compact", maximumFractionDigits: 1}).format(n || 0);
@@ -508,6 +534,18 @@
     q.replaceChildren(...live.queries.slice(0, 8).map(text => el("li", text === live.current ? "on" : "", text)));
     const elapsed = $(".elapsed", box); elapsed.dataset.start = String(turn.started || turn.created);
     tick(elapsed);
+    const steerLive = $(".steering-live", box);
+    steerLive.hidden = !live.steering;
+    steerLive.textContent = live.finalizing ? T.steerFinalizing : T.steerWorking;
+    const guide = $(".guide", box);
+    guide.hidden = turn.steering_open === false;
+    guide.setAttribute("aria-pressed", String(state.steerTarget === turn.id));
+    guide.onclick = () => {
+      state.steerTarget = turn.id;
+      renderFollowMode();
+      $("#follow").scrollIntoView({behavior: "smooth", block: "end"});
+      $("#fq").focus({preventScroll: true});
+    };
     const cancel = $(".cancel", box);
     cancel.onclick = async () => { cancel.disabled = true; try { await api(`/api/s5/turns/${turn.id}/cancel`, {method: "POST"}); } catch { cancel.disabled = false; } };
     const log = $(".log", box); log.hidden = !live.logs.length;
@@ -678,6 +716,10 @@
         case "source": if (!live.sources.some(s => s.url === event.url)) live.sources.push({url: event.url, domain: event.domain, title: ""}); break;
         case "chunk": live.text += event.text; break;
         case "files": live.files = {done: event.done, total: event.total}; break;
+        case "steer": upsertSteer(turnId, event.steer); live.text = ""; live.steering = true; break;
+        case "steer_files": live.steerFiles = {id: event.id, done: event.done, total: event.total}; break;
+        case "steering_revision": live.text = ""; live.steering = true; break;
+        case "steering_finalizing": setTurn(turnId, {steering_open: false}); live.finalizing = true; live.steering = true; break;
         case "log": live.logs.push(event.text); break;
         case "done":
           source.close(); state.streams.delete(turnId); state.live.delete(turnId);
@@ -697,6 +739,14 @@
     const turn = state.thread.turns.find(t => t.id === id);
     if (turn) Object.assign(turn, fields);
   }
+  function upsertSteer(turnId, record) {
+    const turn = state.thread?.turns.find(t => t.id === turnId);
+    if (!turn || !record) return;
+    if (!turn.steering) turn.steering = [];
+    const index = turn.steering.findIndex(s => s.id === record.id);
+    if (index < 0) turn.steering.push(record);
+    else if ((record.revision || 0) >= (turn.steering[index].revision || 0)) turn.steering[index] = record;
+  }
   function fillStart(id) {
     const turn = state.thread && state.thread.turns.find(t => t.id === id);
     if (turn && !turn.started) turn.started = Date.now() / 1000;
@@ -706,6 +756,7 @@
     const index = state.thread.turns.findIndex(t => t.id === id);
     const node = document.querySelector(`.turn[data-id="${id}"]`);
     if (index >= 0 && node) fillTurn(node, state.thread.turns[index], index === 0);
+    renderFollowMode();
     renderTotal();
     scheduleRail();
   }
@@ -937,6 +988,31 @@
     } catch (error) { if (error.message !== "expired") banner(T.genericError); return false; }
   }
   function closeOpts(button, panel) { panel.hidden = true; button.setAttribute("aria-expanded", "false"); }
+  function renderFollowMode() {
+    const turn = state.thread?.turns.find(t => t.id === state.steerTarget);
+    if (state.steerTarget && !turn) state.steerTarget = null;
+    const steering = !!turn, open = steering && active(turn) && turn.steering_open !== false;
+    const target = $("#steerTarget"), text = $("#steerTargetText"), input = $("#fq");
+    target.hidden = !steering;
+    $("#steerHint").hidden = !open;
+    if (steering) {
+      text.textContent = open ? T.steerFor(turn.question) : T.steerClosed;
+      text.title = text.textContent;
+      closeOpts($("#fOptBtn"), $("#fopts"));
+    }
+    input.required = !steering;
+    input.placeholder = steering ? T.steerPh : T.followPh;
+    $("label[for='fq']").textContent = steering ? T.steerPh : T.followPh;
+    $("#kinds").hidden = steering;
+    $("#fmodes").hidden = steering || state.kind !== "research";
+    $("#fOptBtn").hidden = steering;
+    document.querySelectorAll(".turn .guide").forEach(button =>
+      button.setAttribute("aria-pressed", String(button.closest(".turn")?.dataset.id === state.steerTarget)));
+    const send = $("#follow .send");
+    send.disabled = state.followSending || (steering && !open);
+    send.title = steering ? T.steerSend : T.send;
+    send.setAttribute("aria-label", send.title);
+  }
   async function submitHome(event) {
     event.preventDefault();
     closeOpts($("#optBtn"), $("#opts"));
@@ -954,10 +1030,31 @@
   async function submitFollow(event) {
     event.preventDefault();
     closeOpts($("#fOptBtn"), $("#fopts"));
-    const f = $("#fq"), question = f.value.trim(); if (!question) return;
+    if (state.followSending) return;
+    const f = $("#fq"), question = f.value.trim(), target = state.steerTarget;
     if (state.followComposer.busy()) { banner(T.waitUploads); return; }
-    if (await ask(question, state.kind, state.kind === "research" ? state.mode : "quick", state.followComposer)) {
-      f.value = ""; autosize(f); $("#banner").hidden = true;
+    const extras = state.followComposer.extras();
+    if (!question && !(target && (extras.attachments.length || extras.location))) return;
+    if (target && state.followComposer.items.some(item => item.state === "error")) { banner(T.steerFileError); return; }
+    state.followSending = true; renderFollowMode();
+    try {
+      if (target) {
+        const result = await api(`/api/s5/turns/${target}/steering`, {method: "POST",
+          body: {message: question, ...extras}});
+        upsertSteer(target, result.steer);
+        const live = liveOf(target);
+        live.text = ""; live.steering = true;
+        state.followComposer.reset();
+        f.value = ""; autosize(f); $("#banner").hidden = true; redraw(target);
+      } else if (await ask(question, state.kind, state.kind === "research" ? state.mode : "quick", state.followComposer)) {
+        f.value = ""; autosize(f); $("#banner").hidden = true;
+      }
+    } catch (error) {
+      if (error.detail === "steering_closed") { setTurn(target, {steering_open: false}); banner(T.steerClosedNotice); }
+      else if (error.detail === "attachments") banner(T.steerFileError);
+      else if (error.message !== "expired") banner(T.genericError);
+    } finally {
+      state.followSending = false; renderFollowMode();
     }
   }
   function autosize(t) { t.style.height = "auto"; t.style.height = `${Math.min(t.scrollHeight, window.innerHeight * 0.4)}px`; }
@@ -988,6 +1085,7 @@
     state.followComposer = makeComposer($("#follow"));
     $("#ask").addEventListener("submit", submitHome);
     $("#follow").addEventListener("submit", submitFollow);
+    $("#steerExit").addEventListener("click", () => { state.steerTarget = null; renderFollowMode(); $("#fq").focus(); });
     enterSubmits($("#q"), $("#ask")); enterSubmits($("#fq"), $("#follow"));
     const toggleOpts = (button, panel) => button.addEventListener("click", () => {
       panel.hidden = !panel.hidden; button.setAttribute("aria-expanded", String(!panel.hidden));

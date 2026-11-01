@@ -96,12 +96,17 @@ class Uploads:
         self.remove(orphans)
         return len(stale) + len(orphans)
 
-    async def wait(self, turn_id, on_progress, timeout=3 * 3600, every=2):
-        """Wait until the turn's attachments are processed; returns them."""
+    async def wait(self, turn_id, on_progress, timeout=3 * 3600, every=2, ids=None):
+        """Wait until the selected attachments are processed; returns them in their original order."""
         deadline = self.clock() + timeout
         last = None
         while True:
             uploads = self.store.turn_uploads(turn_id)
+            if ids is not None:
+                by_id = {u["id"]: u for u in uploads}
+                if any(upload_id not in by_id for upload_id in ids):
+                    raise RuntimeError("A bound attachment is missing")
+                uploads = [by_id[upload_id] for upload_id in ids]
             done = sum(u["state"] in ("ready", "error") for u in uploads)
             if done != last:
                 last = done

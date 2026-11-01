@@ -57,6 +57,23 @@ CREATE TABLE IF NOT EXISTS uploads (
     updated REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS uploads_turn ON uploads(turn_id);
+CREATE TABLE IF NOT EXISTS steering (
+    id TEXT PRIMARY KEY,
+    turn_id TEXT NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
+    message TEXT NOT NULL,
+    attachments TEXT NOT NULL DEFAULT '[]',
+    location TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL,
+    error TEXT NOT NULL DEFAULT '',
+    revision INTEGER NOT NULL DEFAULT 0,
+    created REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS steering_turn ON steering(turn_id, created);
+CREATE TABLE IF NOT EXISTS report_versions (
+    id INTEGER PRIMARY KEY,
+    turn_id TEXT NOT NULL REFERENCES turns(id) ON DELETE CASCADE,
+    files TEXT NOT NULL
+);
 """
 
 ACTIVE = ("queued", "running")
@@ -106,10 +123,32 @@ class Store:
         return turn
 
     @staticmethod
+    def _steer(row):
+        steer = dict(row)
+        steer["attachments"] = json.loads(steer["attachments"] or "[]")
+        steer["location"] = json.loads(steer["location"]) if steer["location"] else None
+        return steer
+
+    @classmethod
+    def _steers(cls, conn, turn_id):
+        return [cls._steer(row) for row in conn.execute(
+            "SELECT * FROM steering WHERE turn_id=? ORDER BY created, rowid", (turn_id,))]
+
+    @staticmethod
     def _upload(row):
         upload = dict(row)
         upload["meta"] = json.loads(upload["meta"] or "{}")
         return upload
+
+    @staticmethod
+    def _upload_snapshot(conn, attachments):
+        snapshot = []
+        for upload_id in attachments:
+            row = conn.execute("SELECT * FROM uploads WHERE id=?", (upload_id,)).fetchone()
+            if row is None or row["turn_id"] is not None or row["state"] not in ("processing", "ready"):
+                raise ValueError(f"attachment {upload_id}")
+            snapshot.append({"id": row["id"], "kind": row["kind"], "name": row["name"], "size": row["size"]})
+        return snapshot
 
     def create_thread(self, title):
         now = self.clock()
@@ -129,12 +168,7 @@ class Store:
             try:
                 if conn.execute("SELECT 1 FROM threads WHERE id=?", (thread_id,)).fetchone() is None:
                     raise KeyError(thread_id)
-                snapshot = []
-                for upload_id in attachments:
-                    row = conn.execute("SELECT * FROM uploads WHERE id=?", (upload_id,)).fetchone()
-                    if row is None or row["turn_id"] is not None or row["state"] not in ("processing", "ready"):
-                        raise ValueError(f"attachment {upload_id}")
-                    snapshot.append({"id": row["id"], "kind": row["kind"], "name": row["name"], "size": row["size"]})
+                snapshot = self._upload_snapshot(conn, attachments)
                 seq = conn.execute("SELECT COALESCE(MAX(seq),0)+1 FROM turns WHERE thread_id=?",
                                    (thread_id,)).fetchone()[0]
                 conn.execute(
@@ -152,6 +186,88 @@ class Store:
                 raise
         return turn_id
 
+    def add_steer(self, turn_id, message, attachments=(), location=None):
+        """Bind the new instruction and its uploads atomically to an active turn."""
+        now = self.clock()
+        steer_id = new_id()
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                turn = conn.execute("SELECT thread_id,status FROM turns WHERE id=?", (turn_id,)).fetchone()
+                if turn is None:
+                    raise KeyError(turn_id)
+                if turn["status"] not in ACTIVE:
+                    raise RuntimeError("inactive")
+                snapshot = self._upload_snapshot(conn, attachments)
+                conn.execute(
+                    "INSERT INTO steering(id,turn_id,message,attachments,location,status,created)"
+                    " VALUES (?,?,?,?,?,'pending',?)",
+                    (steer_id, turn_id, message, json.dumps(snapshot, ensure_ascii=False),
+                     json.dumps(location, ensure_ascii=False) if location else "", now))
+                for item in snapshot:
+                    conn.execute("UPDATE uploads SET turn_id=?, updated=? WHERE id=?", (turn_id, now, item["id"]))
+                conn.execute("UPDATE threads SET updated=? WHERE id=?", (now, turn["thread_id"]))
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+        return steer_id
+
+    def steers(self, turn_id):
+        with self.connect() as conn:
+            return self._steers(conn, turn_id)
+
+    def update_steer(self, steer_id, *, status, error=""):
+        if status not in ("pending", "ready", "applying", "applied", "error"):
+            raise ValueError("Invalid steering status")
+        with self.connect() as conn:
+            conn.execute("UPDATE steering SET status=?, error=?, revision=revision+1 WHERE id=?",
+                         (status, error, steer_id))
+            row = conn.execute("SELECT * FROM steering WHERE id=?", (steer_id,)).fetchone()
+        return None if row is None else self._steer(row)
+
+    def finish_turn(self, turn_id, status, processed, warnings, **fields):
+        """Publish the final answer and its steering states together."""
+        allowed = {"answer", "sources", "files", "error", "finished", "tokens_in", "tokens_out", "llm_calls", "engines"}
+        if status not in ("done", "cancelled", "error") or set(fields) - allowed:
+            raise ValueError("Invalid final turn fields")
+        values = {k: json.dumps(v, ensure_ascii=False) if k in ("sources", "files", "engines") else v
+                  for k, v in {"status": status, **fields}.items()}
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                if conn.execute("SELECT 1 FROM turns WHERE id=?", (turn_id,)).fetchone() is None:
+                    conn.execute("ROLLBACK")
+                    return False
+                if status == "done":
+                    for steer_id in processed:
+                        changed = conn.execute(
+                            "UPDATE steering SET status='applied', error=?, revision=revision+1"
+                            " WHERE id=? AND turn_id=? AND status='applying'",
+                            (warnings.get(steer_id, ""), steer_id, turn_id)).rowcount
+                        if changed != 1:
+                            raise RuntimeError("Cannot finalize a steering update")
+                else:
+                    reason = "cancelled" if status == "cancelled" else "failed"
+                    conn.execute(
+                        "UPDATE steering SET status='error', error=?, revision=revision+1 WHERE turn_id=?"
+                        " AND status IN ('pending','ready','applying')", (reason, turn_id))
+                assignments = ",".join(f"{name}=?" for name in values)
+                conn.execute(f"UPDATE turns SET {assignments} WHERE id=?", (*values.values(), turn_id))
+                conn.execute("UPDATE threads SET updated=? WHERE id=(SELECT thread_id FROM turns WHERE id=?)",
+                             (self.clock(), turn_id))
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+        return True
+
+    def remember_report(self, turn_id, files):
+        if files:
+            with self.connect() as conn:
+                conn.execute("INSERT INTO report_versions(turn_id,files) VALUES (?,?)",
+                             (turn_id, json.dumps(files, ensure_ascii=False)))
+
     def update_turn(self, turn_id, **fields):
         allowed = {"status", "answer", "sources", "files", "error", "started", "finished", "lang", "brief",
                    "tokens_in", "tokens_out", "llm_calls", "engines"}
@@ -168,7 +284,11 @@ class Store:
     def turn(self, turn_id):
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM turns WHERE id=?", (turn_id,)).fetchone()
-        return None if row is None else self._turn(row)
+            if row is None:
+                return None
+            turn = self._turn(row)
+            turn["steering"] = self._steers(conn, turn_id)
+        return turn
 
     def thread(self, thread_id):
         with self.connect() as conn:
@@ -177,6 +297,8 @@ class Store:
                 return None
             turns = [self._turn(r) for r in conn.execute(
                 "SELECT * FROM turns WHERE thread_id=? ORDER BY seq", (thread_id,))]
+            for turn in turns:
+                turn["steering"] = self._steers(conn, turn["id"])
         totals = {key: sum(t[key] for t in turns) for key in ("tokens_in", "tokens_out", "llm_calls")}
         return {**dict(row), "turns": turns, **totals}
 
@@ -195,6 +317,9 @@ class Store:
         with self.connect() as conn:
             files = [json.loads(r[0] or "{}") for r in conn.execute(
                 "SELECT files FROM turns WHERE thread_id=?", (thread_id,))]
+            files += [json.loads(r[0] or "{}") for r in conn.execute(
+                "SELECT v.files FROM report_versions v JOIN turns t ON v.turn_id=t.id WHERE t.thread_id=?",
+                (thread_id,))]
             uploads = [r[0] for r in conn.execute(
                 "SELECT u.id FROM uploads u JOIN turns t ON u.turn_id=t.id WHERE t.thread_id=?", (thread_id,))]
             deleted = conn.execute("DELETE FROM threads WHERE id=?", (thread_id,)).rowcount
@@ -266,12 +391,26 @@ class Store:
 
     def history(self, thread_id, before_seq):
         with self.connect() as conn:
-            return [self._turn(r) for r in conn.execute(
+            turns = [self._turn(r) for r in conn.execute(
                 "SELECT * FROM turns WHERE thread_id=? AND seq<? ORDER BY seq", (thread_id, before_seq))]
+            for turn in turns:
+                turn["steering"] = self._steers(conn, turn["id"])
+        return turns
 
     def fail_interrupted(self):
         """After a restart nothing is running any more: mark leftovers instead of leaving them spinning."""
         with self.connect() as conn:
-            return conn.execute(
-                "UPDATE turns SET status='error', error='interrupted', finished=? WHERE status IN (?,?)",
-                (self.clock(), *ACTIVE)).rowcount
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute(
+                    "UPDATE steering SET status='error', error='interrupted', revision=revision+1"
+                    " WHERE status IN ('pending','ready','applying') AND turn_id IN"
+                    " (SELECT id FROM turns WHERE status IN (?,?))", ACTIVE)
+                count = conn.execute(
+                    "UPDATE turns SET status='error', error='interrupted', finished=? WHERE status IN (?,?)",
+                    (self.clock(), *ACTIVE)).rowcount
+                conn.execute("COMMIT")
+            except BaseException:
+                conn.execute("ROLLBACK")
+                raise
+        return count

@@ -150,6 +150,22 @@ button{cursor:pointer}
 .att:hover{border-color:var(--cp-border-strong)}
 .att svg{width:18px;height:18px;color:var(--cp-text-muted);margin:0 4px}
 .att.loc svg{color:var(--cp-accent)}
+.steer-target{display:flex;align-items:center;gap:8px;margin:0 0 6px;padding:5px 8px 5px 10px;
+  border-radius:var(--rs);background:var(--cp-accent-soft);color:var(--cp-text);font-size:13px;font-weight:600}
+.steer-target span{flex:1;min-width:0;max-height:4.5em;overflow-y:auto;white-space:normal;overflow-wrap:anywhere}
+.steer-hint{margin:0 10px 6px;font-size:11px;color:var(--cp-text-muted)}
+.steer-exit{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;border:0;
+  border-radius:50%;background:transparent;color:var(--cp-text-muted)}
+.steer-exit:hover{background:var(--cp-surface)}
+.steer-exit svg{width:16px;height:16px}
+.steering-list{display:flex;flex-direction:column;gap:8px;margin:0 0 14px}
+.steer-msg{padding:10px 12px;border:1px solid var(--cp-border);border-radius:var(--rs);background:var(--cp-surface)}
+.steer-head{display:flex;flex-wrap:wrap;justify-content:space-between;gap:4px 12px;font-size:12px;
+  font-weight:600;color:var(--cp-text-muted)}
+.steer-status.error{color:var(--cp-danger)}
+.steer-status.warning{color:var(--cp-text)}
+.steer-text{margin:5px 0 0;white-space:pre-wrap;overflow-wrap:anywhere;font-size:14px}
+.steer-msg .att-row{margin:8px 0 0}
 .opts{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin:12px 0 4px;padding-top:12px;
   border-top:1px solid var(--cp-border)}
 .opts label{display:flex;flex-direction:column;gap:4px;font-size:13px;color:var(--cp-text-muted)}
@@ -198,6 +214,8 @@ button{cursor:pointer}
 .queries li.on{color:var(--cp-text)}
 .prog-foot{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:12px;font-size:13px;
   color:var(--cp-text-muted)}
+.prog-controls{display:flex;align-items:center;gap:16px}
+.steering-live{margin:12px 0 0;font-size:13px;color:var(--cp-text-muted)}
 .link-btn{border:0;background:transparent;color:var(--cp-link);padding:4px 0;font-size:14px}
 .link-btn:hover{text-decoration:underline}
 .log{margin-top:8px;font-size:12px;color:var(--cp-text-muted)}
