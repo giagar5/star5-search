@@ -43,12 +43,15 @@ your own server behind your own login. Your questions, history and files stay wi
 - **Conversations.** Ask follow-ups on the report ("from the report") or start a new web
   search with the previous context. The history is always visible: the latest searches are
   on the home page and the full history is in the sidebar, the same on every device.
-- **Guide a running answer.** Use "Guide this answer" to add directions, files or a
-  location while a search or report chat is running. Directions can change the scope or
-  answer language; later ones take precedence. Research may search the web again and
-  rewrite the answer, taking extra time and tokens. The UI shows whether each direction
-  was applied or failed; if the answer is already being finalized, the unsent draft and
-  files remain available for a follow-up.
+- **Guide a running answer.** While a search or report chat can still take directions,
+  the follow-up box shows two choices: "Guide this answer" (coral) adds directions, files
+  or a location to it, "New question" queues a separate question that starts when the
+  current answer ends. The "Guide this answer" link under a running turn picks that turn.
+  Directions can change the scope or answer language; later ones take precedence.
+  Research may search the web again and rewrite the answer, taking extra time and tokens.
+  The UI shows whether each direction was applied or failed. When the answer starts
+  finalizing, the guide option disappears and an unsent draft with its files switches to
+  "New question", with a notice.
 - **Attachments.**
   - Photos, including HEIC: the vision model reads visible text, brands and places.
   - Audio and voice recordings: transcribed locally with Whisper.
