@@ -1405,9 +1405,9 @@ class ApiTests(Star5Case):
         csp = index.headers["content-security-policy"]
         self.assertIn("manifest-src 'self'", csp)
         self.assertIn("worker-src 'self'", csp)
-        self.assertIn('/s5/icon-192.png?v=6" type="image/png"', index.text)
-        self.assertEqual(index.text.count('src="/s5/icon-192.png?v=6"'), 2)
-        self.assertIn('/s5/apple-touch-icon.png?v=6', index.text)
+        self.assertIn('/s5/icon-192.png?v=7" type="image/png"', index.text)
+        self.assertEqual(index.text.count('src="/s5/icon-192.png?v=7"'), 2)
+        self.assertIn('/s5/apple-touch-icon.png?v=7', index.text)
         apple_icon = self.client.get("/s5/apple-touch-icon.png")
         self.assertEqual(apple_icon.status_code, 200)
         self.assertEqual(int.from_bytes(apple_icon.content[16:20], "big"), 180)
