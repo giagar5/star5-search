@@ -217,10 +217,19 @@ class Star5Case(unittest.TestCase):
         import star5.web as web
         self.addCleanup(setattr, web, "OUTPUTS", web.OUTPUTS)
         web.OUTPUTS = (Path(self.tmp.name) / "outputs").resolve()
+        self.speech_calls = []
+
+        async def fake_speech(document):
+            self.speech_calls.append(document)
+            if "FAIL" in document:
+                raise RuntimeError("proxy down")
+            return b"ID3" + str(len(self.speech_calls)).encode()
+
         self.runner = install(self.app, data_dir=Path(self.tmp.name) / "data", base_config=str(base),
                               research_fn=self.fakes.research, chat_fn=self.fakes.chat, brief_fn=self.fakes.brief,
                               media_fn=self.fakes.process_media, geocode_fn=self.fakes.geocode,
-                              fast_fn=self.fakes.fast, steer_fn=self.fakes.steer, steer_report_fn=self.fakes.steer_report)
+                              fast_fn=self.fakes.fast, steer_fn=self.fakes.steer, steer_report_fn=self.fakes.steer_report,
+                              speech_fn=fake_speech)
         self.uploads = self.app.state.star5_uploads
         self.data = Path(self.tmp.name) / "data"
         self.runner.tick_every = 0.02
@@ -1405,9 +1414,9 @@ class ApiTests(Star5Case):
         csp = index.headers["content-security-policy"]
         self.assertIn("manifest-src 'self'", csp)
         self.assertIn("worker-src 'self'", csp)
-        self.assertIn('/s5/icon-192.png?v=7" type="image/png"', index.text)
-        self.assertEqual(index.text.count('src="/s5/icon-192.png?v=7"'), 2)
-        self.assertIn('/s5/apple-touch-icon.png?v=7', index.text)
+        self.assertIn('/s5/icon-192.png?v=8" type="image/png"', index.text)
+        self.assertEqual(index.text.count('src="/s5/icon-192.png?v=8"'), 2)
+        self.assertIn('/s5/apple-touch-icon.png?v=8', index.text)
         apple_icon = self.client.get("/s5/apple-touch-icon.png")
         self.assertEqual(apple_icon.status_code, 200)
         self.assertEqual(int.from_bytes(apple_icon.content[16:20], "big"), 180)
@@ -1550,6 +1559,45 @@ class ApiTests(Star5Case):
         self.assertFalse(Path("outputs/t1.md").exists())
         self.assertTrue(keep.exists())
         self.assertEqual(self.client.get(f"/api/s5/threads/{started['thread']}").status_code, 404)
+
+    def test_speech_reads_finished_answer_with_cache_budget_and_cleanup(self):
+        started = self.start()
+        self.events(started["turn"])
+        url = f"/api/s5/turns/{started['turn']}/speech"
+        parts = {"parts": [{"text": "Titolo & <capitolo>", "heading": True}, {"text": "Primo  paragrafo.\x07"}]}
+        first = self.client.post(url, headers=H, json=parts)
+        self.assertEqual(first.status_code, 200, first.text)
+        self.assertEqual((first.headers["content-type"], first.headers["cache-control"]), ("audio/mpeg", "no-store"))
+        self.assertEqual(first.content, b"ID31")
+        document = self.speech_calls[0]
+        self.assertIn('xml:lang="it-IT"', document)
+        self.assertIn("it-IT-Isabella:DragonHDLatestNeural", document)
+        self.assertIn("<p>Titolo &amp; &lt;capitolo&gt;</p><break", document)
+        self.assertIn("<p>Primo paragrafo.</p>", document)
+        self.assertEqual(self.client.post(url, headers=H, json=parts).content, b"ID31")
+        self.assertEqual(len(self.speech_calls), 1)
+        self.assertEqual(self.client.post(url, json=parts).status_code, 403)
+        for bad in ({}, {"parts": []}, {"parts": [{"text": "   "}]}, {"parts": [{"text": "x" * 3001}]},
+                    {"parts": "testo"}, {"parts": [{"text": 5}]}):
+            with self.subTest(body=bad):
+                self.assertEqual(self.client.post(url, headers=H, json=bad).status_code, 400)
+        self.assertEqual(self.client.post("/api/s5/turns/ffffffffffffffff/speech", headers=H, json=parts).status_code, 404)
+        self.assertEqual(self.client.post(url, headers=H, json={"parts": [{"text": "FAIL"}]}).status_code, 502)
+        statuses = [self.client.post(url, headers=H, json={"parts": [{"text": f"{i} " + "y" * 2900}]}).status_code
+                    for i in range(4)]
+        self.assertIn(429, statuses)
+        folder = self.data / "speech" / started["turn"]
+        self.assertTrue(any(folder.glob("*.mp3")))
+        self.client.delete(f"/api/s5/threads/{started['thread']}", headers=H)
+        self.assertFalse(folder.exists())
+
+    def test_speech_waits_for_a_finished_answer(self):
+        self.fakes.gate = asyncio.Event()
+        started = self.start()
+        response = self.client.post(f"/api/s5/turns/{started['turn']}/speech", headers=H,
+                                    json={"parts": [{"text": "ciao"}]})
+        self.assertEqual(response.status_code, 409)
+        self.client.post(f"/api/s5/turns/{started['turn']}/cancel", headers=H)
 
     def test_validation_and_csrf_header(self):
         bad = [

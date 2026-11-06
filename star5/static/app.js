@@ -26,6 +26,8 @@
     x: '<path d="M7 7l10 10M17 7L7 17"/>',
     compass: '<circle cx="12" cy="12" r="9"/><path d="M15.5 8.5l-2 5-5 2 2-5z"/>',
     queue: '<path d="M4 6h12M4 12h12M4 18h7"/><path d="M18 14v7M14.5 17.5h7"/>',
+    speaker: '<path d="M4 9h4l5-4v14l-5-4H4z"/><path d="M16.5 8.5a5 5 0 0 1 0 7M19 6a8.5 8.5 0 0 1 0 12"/>',
+    pause: '<path d="M8 5v14M16 5v14"/>',
   };
   const icon = name => { const s = document.createElementNS("http://www.w3.org/2000/svg", "svg"); s.setAttribute("viewBox", "0 0 24 24"); s.setAttribute("aria-hidden", "true"); s.innerHTML = ICON[name]; return s; };
 
@@ -227,6 +229,7 @@
   }
   async function route() {
     const match = location.hash.match(/^#\/t\/([a-f0-9]{16})$/);
+    if (!match || state.thread?.id !== match[1]) stopReading();
     if (!match || state.thread?.id !== match[1]) Object.assign(state, {steerTarget: null, composeMode: "follow", steerNotice: false});
     closeStreams();
     if (!match) {
@@ -680,6 +683,10 @@
   function renderActions(node, turn, first, running) {
     const box = $(".actions", node); box.replaceChildren();
     if (running) { box.hidden = true; return; }
+    if (turn.answer && turn.status === "done") {
+      const listen = el("span", "listen"); listen.dataset.turn = turn.id;
+      paintListen(listen); box.append(listen);
+    }
     if (turn.answer) {
       const copy = action("copy", T.copy, async () => {
         try { await navigator.clipboard.writeText(turn.answer); copy.lastChild.textContent = T.copied; setTimeout(() => { copy.lastChild.textContent = T.copy; }, 1500); } catch { /* clipboard denied */ }
@@ -697,6 +704,210 @@
       location.hash = "#/"; loadLibrary();
     }), {className: "act danger"}));
     box.hidden = !box.childElementCount;
+  }
+
+  /* ---------- read aloud: Azure neural voices through /speech, one growing chunk at a time ---------- */
+  const RATES = [1, 1.25, 1.5, 1.75, 2, 0.75];
+  const NO_READ = /riferiment|referenc|fonti|sources|bibliogra|références|quellen|literatur|fuentes|bronnen/i;
+  const CHUNK_GOALS = [220, 650, 1300, 2000], CHUNK_MAX = 2600, HEADING_PAUSE = 40;
+  const savedRate = Number(store.get("s5.rate", "1"));
+  const player = {turn: null, blocks: [], chunks: [], index: 0, status: "idle", gen: 0, urls: new Map(),
+    loading: new Map(), audio: null, mark: null, rate: RATES.includes(savedRate) ? savedRate : 1};
+  let silentUrl = null;
+
+  function readBlocks(answer) {
+    const out = []; let skip = false;
+    answer.querySelectorAll("h1,h2,h3,h4,h5,h6,p,li,blockquote").forEach(node => {
+      const heading = /^H\d$/.test(node.tagName);
+      if (heading) skip = NO_READ.test(node.textContent);
+      if (skip || node.closest("table,pre") || (node.tagName === "P" && node.parentElement.closest("li,blockquote"))) return;
+      const copy = node.cloneNode(true);
+      copy.querySelectorAll("sup,ul,ol,table,pre,img,blockquote").forEach(n => n.remove());
+      const text = copy.textContent.replace(/https?:\/\/\S+/g, "").replace(/\s+/g, " ").trim();
+      if (/[\p{L}\p{N}]/u.test(text)) out.push({node, text, heading});
+    });
+    return out;
+  }
+  function sentences(text) {
+    const out = [];
+    for (let s of text.match(/.+?(?:[.!?…]+(?=\s|$)|$)\s*/gsu) || [text]) {
+      while (s.length > CHUNK_MAX) {
+        const space = s.lastIndexOf(" ", CHUNK_MAX), cut = space > 0 ? space + 1 : CHUNK_MAX;
+        out.push(s.slice(0, cut)); s = s.slice(cut);
+      }
+      if (s) out.push(s);
+    }
+    return out;
+  }
+  // Short first chunk so the voice starts within seconds, then longer ones fetched while the previous plays.
+  function makeChunks(blocks) {
+    const chunks = []; let cur = null;
+    blocks.forEach((block, bi) => sentences(block.text).forEach(text => {
+      const goal = CHUNK_GOALS[Math.min(Math.max(chunks.length - 1, 0), CHUNK_GOALS.length - 1)];
+      if (!cur || (cur.size && cur.size + text.length > goal) || cur.parts.length >= 50) {
+        cur = {parts: [], blocks: [], size: 0}; chunks.push(cur);
+      }
+      if (cur.blocks[cur.blocks.length - 1] === bi) cur.parts[cur.parts.length - 1].text += text;
+      else { cur.parts.push({text, heading: block.heading}); cur.blocks.push(bi); }
+      cur.size += text.length;
+    }));
+    chunks.forEach(c => c.parts.forEach(p => { p.text = p.text.trim(); }));
+    return chunks;
+  }
+  // A silent clip played inside the tap unlocks the element, so later chunks may start after a network wait.
+  function silence() {
+    if (silentUrl) return silentUrl;
+    const n = 800, v = new DataView(new ArrayBuffer(44 + n));
+    const w = (o, s) => [...s].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
+    w(0, "RIFF"); v.setUint32(4, 36 + n, true); w(8, "WAVEfmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true);
+    v.setUint16(22, 1, true); v.setUint32(24, 8000, true); v.setUint32(28, 8000, true); v.setUint16(32, 1, true);
+    v.setUint16(34, 8, true); w(36, "data"); v.setUint32(40, n, true);
+    for (let i = 0; i < n; i++) v.setUint8(44 + i, 128);
+    return (silentUrl = URL.createObjectURL(new Blob([v.buffer], {type: "audio/wav"})));
+  }
+  function audioEl() {
+    if (player.audio) return player.audio;
+    const a = player.audio = new Audio();
+    a.preload = "auto";
+    a.addEventListener("ended", () => { if (player.status === "playing") playChunk(player.index + 1); });
+    a.addEventListener("timeupdate", markReading);
+    a.addEventListener("pause", () => { if (player.status === "playing" && !a.ended) { player.status = "paused"; paintAll(); } });
+    a.addEventListener("play", () => { if (player.status === "paused") { player.status = "playing"; paintAll(); } });
+    return a;
+  }
+  function loadChunk(i) {
+    if (player.urls.has(i)) return Promise.resolve(player.urls.get(i));
+    if (player.loading.has(i)) return player.loading.get(i);
+    const gen = player.gen, turnId = player.turn, parts = player.chunks[i].parts;
+    const job = (async () => {
+      const res = await fetch(`/api/s5/turns/${turnId}/speech`, {method: "POST", credentials: "same-origin",
+        redirect: "manual", cache: "no-store", headers: {"X-Star5": "1", "Content-Type": "application/json"},
+        body: JSON.stringify({parts})});
+      if (res.type === "opaqueredirect" || res.status === 401) { expired(); throw Object.assign(new Error("expired"), {status: 401}); }
+      if (!res.ok) throw Object.assign(new Error(`HTTP ${res.status}`), {status: res.status});
+      const url = URL.createObjectURL(await res.blob());
+      if (gen !== player.gen) { URL.revokeObjectURL(url); throw new Error("stale"); }
+      player.urls.set(i, url);
+      return url;
+    })();
+    player.loading.set(i, job);
+    job.catch(() => {}).finally(() => { if (gen === player.gen) player.loading.delete(i); });
+    return job;
+  }
+  async function playChunk(i) {
+    if (!player.turn) return;
+    if (i >= player.chunks.length) { stopReading(); return; }
+    i = Math.max(0, i);
+    const gen = player.gen;
+    player.index = i; player.status = "loading"; paintAll();
+    let url;
+    try { url = await loadChunk(i); } catch (error) {
+      if (gen !== player.gen) return;
+      stopReading();
+      if (error.status !== 401) banner(error.status === 429 ? T.listenLimit : T.listenError);
+      return;
+    }
+    if (gen !== player.gen) return;
+    const a = audioEl();
+    a.src = url; a.defaultPlaybackRate = player.rate; a.playbackRate = player.rate;
+    player.status = "playing"; paintAll();
+    try { await a.play(); } catch { if (gen === player.gen) { player.status = "paused"; paintAll(); } }
+    if (gen === player.gen && i + 1 < player.chunks.length) loadChunk(i + 1).catch(() => {});
+  }
+  function startReading(turnId) {
+    stopReading();
+    const answer = document.querySelector(`.turn[data-id="${turnId}"] .answer`);
+    const blocks = answer ? readBlocks(answer) : [];
+    if (!blocks.length) return;
+    const a = audioEl(); a.src = silence(); a.play().catch(() => {});
+    Object.assign(player, {turn: turnId, blocks, chunks: makeChunks(blocks), index: 0});
+    mediaSession(turnId);
+    playChunk(0);
+  }
+  function stopReading() {
+    if (!player.turn) return;
+    player.gen++;
+    if (player.audio) { player.audio.pause(); player.audio.removeAttribute("src"); player.audio.load(); }
+    player.urls.forEach(url => URL.revokeObjectURL(url));
+    Object.assign(player, {turn: null, blocks: [], chunks: [], index: 0, status: "idle", urls: new Map(), loading: new Map()});
+    mark(null); paintAll();
+    if ("mediaSession" in navigator) navigator.mediaSession.metadata = null;
+  }
+  function toggleReading(turnId) {
+    if (player.turn !== turnId) { startReading(turnId); return; }
+    if (player.status === "loading") { stopReading(); return; }
+    if (player.status === "playing") { player.status = "paused"; player.audio.pause(); }
+    else { player.status = "playing"; player.audio.play().catch(() => {}); }
+    paintAll();
+  }
+  function nextRate() {
+    player.rate = RATES[(RATES.indexOf(player.rate) + 1) % RATES.length];
+    store.set("s5.rate", String(player.rate));
+    if (player.audio) { player.audio.defaultPlaybackRate = player.rate; player.audio.playbackRate = player.rate; }
+    paintAll();
+  }
+  function mark(node) {
+    if (player.mark === node) return;
+    player.mark?.classList.remove("reading");
+    player.mark = node; node?.classList.add("reading");
+  }
+  // Highlight the paragraph being read, estimated from the elapsed share of the chunk's characters.
+  function markReading() {
+    const a = player.audio, chunk = player.chunks[player.index];
+    if (!chunk || player.status === "loading" || !a.duration || !isFinite(a.duration)) return;
+    const weight = p => p.text.length + (p.heading ? HEADING_PAUSE : 0);
+    let at = a.currentTime / a.duration * chunk.parts.reduce((n, p) => n + weight(p), 0), k = 0;
+    for (; k < chunk.parts.length - 1; k++) { at -= weight(chunk.parts[k]); if (at < 0) break; }
+    let block = player.blocks[chunk.blocks[k]];
+    if (block && !block.node.isConnected) {
+      const answer = document.querySelector(`.turn[data-id="${player.turn}"] .answer`);
+      const fresh = answer ? readBlocks(answer) : [];
+      if (fresh.length === player.blocks.length) { player.blocks = fresh; block = fresh[chunk.blocks[k]]; }
+    }
+    mark(block?.node || null);
+  }
+  function mediaSession(turnId) {
+    if (!("mediaSession" in navigator) || typeof MediaMetadata === "undefined") return;
+    const turn = state.thread?.turns.find(t => t.id === turnId);
+    navigator.mediaSession.metadata = new MediaMetadata({title: turn?.question || "Star5 Search", artist: "Star5 Search",
+      artwork: [{src: "/s5/icon-512.png?v=8", sizes: "512x512", type: "image/png"}]});
+    const handlers = {
+      play: () => { if (player.status === "paused") toggleReading(player.turn); },
+      pause: () => { if (player.status === "playing") toggleReading(player.turn); },
+      stop: stopReading,
+      nexttrack: () => { if (player.turn && player.status !== "loading") playChunk(player.index + 1); },
+      previoustrack: () => {
+        if (!player.turn || player.status === "loading") return;
+        if (player.audio.currentTime > 3) player.audio.currentTime = 0; else playChunk(player.index - 1);
+      },
+    };
+    Object.entries(handlers).forEach(([name, fn]) => { try { navigator.mediaSession.setActionHandler(name, fn); } catch { /* unsupported */ } });
+  }
+  function paintListen(box) {
+    const id = box.dataset.turn, mine = player.turn === id, status = mine ? player.status : "idle";
+    const focused = box.contains(document.activeElement) ? document.activeElement.dataset.part : null;
+    const label = {playing: T.listenPause, paused: T.listenResume, loading: T.listenLoading}[status] || T.listen;
+    const main = action(status === "playing" ? "pause" : "speaker", label, () => toggleReading(id));
+    main.dataset.part = "main";
+    main.classList.add("listen-main"); main.classList.toggle("on", mine); main.classList.toggle("busy", status === "loading");
+    const items = [main];
+    if (mine) {
+      const rate = el("button", "act rate", `${player.rate.toLocaleString(state.ui)}×`);
+      rate.type = "button"; rate.dataset.part = "rate"; rate.title = T.listenSpeed; rate.setAttribute("aria-label", `${T.listenSpeed}: ${rate.textContent}`);
+      rate.addEventListener("click", nextRate);
+      const stop = el("button", "act icon-only"); stop.type = "button"; stop.dataset.part = "stop";
+      stop.title = T.listenStop; stop.setAttribute("aria-label", T.listenStop); stop.append(icon("x"));
+      stop.addEventListener("click", stopReading);
+      items.push(rate, stop);
+    }
+    box.replaceChildren(...items);
+    if (focused) box.querySelector(`[data-part="${focused}"]`)?.focus();
+  }
+  function paintAll() {
+    document.querySelectorAll(".listen[data-turn]").forEach(paintListen);
+    if ("mediaSession" in navigator) {
+      navigator.mediaSession.playbackState = player.status === "playing" ? "playing" : player.status === "paused" ? "paused" : "none";
+    }
   }
 
   /* ---------- live events (Server-Sent Events, resumable) ---------- */

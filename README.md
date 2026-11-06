@@ -52,6 +52,14 @@ your own server behind your own login. Your questions, history and files stay wi
   The UI shows whether each direction was applied or failed. When the answer starts
   finalizing, the guide option disappears and an unsent draft with its files switches to
   "New question", with a notice.
+- **Listen.** "Listen" under a finished answer reads it aloud with an Azure neural voice
+  (Dragon HD) in the answer's language. It starts within a few seconds: the text is sent in
+  growing chunks while the previous one plays. Headings, paragraphs and list items are read;
+  tables, code, links and the reference list are skipped. The paragraph being read is
+  highlighted. While it plays, a speed pill (1× to 2×, and 0.75×) and a stop button appear
+  next to it. It keeps playing with the screen locked and shows on the lock screen and
+  in headphone controls. The audio is cached on the server, so replaying it is free.
+  Each answer has a cap on the characters it can have voiced: twice its length plus 4,000.
 - **Attachments.**
   - Photos, including HEIC: the vision model reads visible text, brands and places.
   - Audio and voice recordings: transcribed locally with Whisper.
@@ -109,6 +117,7 @@ browser ──▶ nginx (login, no-store) ──▶ FastAPI app (star5/)
                                           ├─ Veloce pipeline (star5/fast.py)
                                           ├─ GPT Researcher agent (Standard, Approfondita)
                                           ├─ attachments: media worker + Whisper (separate venv)
+                                          ├─ read aloud: star5/speech.py ─▶ proxy /speech/tts (Azure Speech)
                                           └─ SQLite: threads, turns, uploads
 models:  any OpenAI-compatible endpoint (here an Azure proxy with "fast" and "frontier" aliases)
 search:  Brave Search API + Bing + DuckDuckGo (ddgs), in parallel, deduplicated, timeout per mode
@@ -134,6 +143,10 @@ Put it behind a reverse proxy that authenticates users.
 
 Attachments need a second environment (`av`, `faster-whisper`, `pillow-heif`) pointed to by
 `STAR5_MEDIA_PYTHON`.
+
+"Listen" posts SSML to `$AZURE_OPENAI_ENDPOINT/speech/tts` with `AZURE_OPENAI_API_KEY`: the
+proxy forwards it to Azure Speech with its managed identity. Audio is cached in
+`$STAR5_DATA/speech/<turn>/` and deleted with the thread.
 
 Tests: `python -m unittest star5.tests.test_star5`.
 

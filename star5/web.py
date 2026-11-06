@@ -27,6 +27,7 @@ from . import engines
 from .fast import fast_research
 from .media import Geocoder, process as process_media
 from .runner import LANGS, MODES, MAX_QUESTION, TONES, UI_LANGS, Runner, detect_lang, language_configs
+from .speech import BudgetExceeded, Speech, clean_parts, synthesize
 from .steering import install as install_steering, refine_research, report_files as steered_report_files
 from .store import Store
 from .uploads import Uploads, clean_location
@@ -188,7 +189,7 @@ def effort_option(body):
 
 def install(app: FastAPI, *, data_dir=None, base_config=None, research_fn=research, chat_fn=chat, brief_fn=brief,
             media_fn=process_media, geocode_fn=None, fast_fn=fast_research, steer_fn=refine_research,
-            steer_report_fn=steered_report_files):
+            steer_report_fn=steered_report_files, speech_fn=synthesize):
     data_dir = Path(data_dir or os.environ.get("STAR5_DATA", "data"))
     base_config = base_config or os.environ.get("CONFIG_PATH")
     install_effort()
@@ -205,6 +206,7 @@ def install(app: FastAPI, *, data_dir=None, base_config=None, research_fn=resear
     shutil.rmtree(docs_root, ignore_errors=True)
     runner = Runner(store, research_fn, chat_fn, configs, brief_fn=brief_fn, uploads=uploads, docs_root=docs_root,
                     fast_fn=fast_fn, steer_fn=steer_fn, steer_report_fn=steer_report_fn)
+    speech = Speech(data_dir / "speech", speech_fn)
     router = APIRouter(prefix="/api/s5")
 
     def guard(request: Request):
@@ -301,6 +303,7 @@ def install(app: FastAPI, *, data_dir=None, base_config=None, research_fn=resear
             runner.cancel(turn["id"])
         _, files, upload_ids = store.delete_thread(thread_id)
         uploads.remove(upload_ids)
+        speech.remove([turn["id"] for turn in found["turns"]])
         for group in files:
             for name in group.values():
                 path = (Path.cwd() / unquote(str(name))).resolve()
@@ -344,6 +347,27 @@ def install(app: FastAPI, *, data_dir=None, base_config=None, research_fn=resear
         record = next(s for s in store.steers(turn_id) if s["id"] == steer_id)
         await job.emit({"t": "steer", "steer": record})
         return {"steer": record}
+
+    @router.post("/turns/{turn_id}/speech")
+    async def speak(turn_id: str, request: Request):
+        guard(request)
+        body = await body_of(request)
+        parts = clean_parts(body.get("parts"))
+        if parts is None:
+            raise HTTPException(400, "parts")
+        turn = store.turn(turn_id)
+        if turn is None:
+            raise HTTPException(404, "turn")
+        if turn.get("status") != "done" or not (turn.get("answer") or "").strip():
+            raise HTTPException(409, "not_ready")
+        try:
+            path = await speech.audio(turn, parts)
+        except BudgetExceeded:
+            raise HTTPException(429, "speech_budget")
+        except Exception:
+            LOG.exception("Speech synthesis failed for turn %s", turn_id)
+            raise HTTPException(502, "speech")
+        return FileResponse(path, media_type="audio/mpeg", headers=NO_STORE)
 
     @router.get("/turns/{turn_id}/events")
     async def events(turn_id: str, request: Request, after: int = 0):
