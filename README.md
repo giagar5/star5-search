@@ -60,6 +60,10 @@ your own server behind your own login. Your questions, history and files stay wi
   next to it. It keeps playing with the screen locked and shows on the lock screen and
   in headphone controls. The audio is cached on the server, so replaying it is free.
   Each answer has a cap on the characters it can have voiced: twice its length plus 4,000.
+- **Share to search (Android).** The installed PWA appears in Android's Share menu for
+  links, text, photos, video, audio and documents. Shared content is staged temporarily
+  in IndexedDB by the service worker, imported into the home composer, and sent only
+  after the user reviews and submits the question.
 - **Attachments.**
   - Photos, including HEIC: the vision model reads visible text, brands and places.
   - Audio and voice recordings: transcribed locally with Whisper.

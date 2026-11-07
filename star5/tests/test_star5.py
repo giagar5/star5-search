@@ -1425,8 +1425,18 @@ class ApiTests(Star5Case):
         self.assertEqual(worker.status_code, 200)
         self.assertIn("javascript", worker.headers["content-type"])
         self.assertIn("no-store", worker.headers["cache-control"])
+        self.assertIn('url.pathname === "/share"', worker.text)
+        self.assertIn("request.formData()", worker.text)
+        self.assertIn('Response.redirect(new URL("/?shared=1"', worker.text)
         manifest = self.client.get("/s5/manifest.json").json()
         self.assertEqual((manifest["start_url"], manifest["scope"], manifest["display"]), ("/", "/", "standalone"))
+        share_target = manifest["share_target"]
+        self.assertEqual((share_target["action"], share_target["method"], share_target["enctype"]),
+                         ("/share", "POST", "multipart/form-data"))
+        self.assertEqual((share_target["params"]["title"], share_target["params"]["text"], share_target["params"]["url"]),
+                         ("title", "text", "url"))
+        self.assertTrue({"image/*", "video/*", "audio/*", ".pdf"} <=
+                        set(share_target["params"]["files"][0]["accept"]))
         sizes = {(i["sizes"], i["purpose"]) for i in manifest["icons"]}
         self.assertTrue({("192x192", "any"), ("512x512", "any"), ("512x512", "maskable")} <= sizes)
         for icon in manifest["icons"]:

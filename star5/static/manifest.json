@@ -7,6 +7,42 @@
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
+  "share_target": {
+    "action": "/share",
+    "method": "POST",
+    "enctype": "multipart/form-data",
+    "params": {
+      "title": "title",
+      "text": "text",
+      "url": "url",
+      "files": [
+        {
+          "name": "files",
+          "accept": [
+            "image/*",
+            "video/*",
+            "audio/*",
+            ".heic",
+            ".heif",
+            ".pdf",
+            ".docx",
+            ".pptx",
+            ".xlsx",
+            ".csv",
+            ".txt",
+            ".md",
+            ".html",
+            ".htm",
+            ".epub",
+            ".m4a",
+            ".opus",
+            ".amr",
+            ".mkv"
+          ]
+        }
+      ]
+    }
+  },
   "orientation": "any",
   "background_color": "#221f2c",
   "theme_color": "#221f2c",

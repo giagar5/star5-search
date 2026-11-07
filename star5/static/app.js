@@ -1164,6 +1164,49 @@
     return c;
   }
 
+  async function importSharedContent() {
+    if (new URLSearchParams(location.search).get("shared") !== "1") return;
+    history.replaceState(null, "", `${location.pathname}${location.hash}`);
+    try {
+      const entries = await new Promise((resolve, reject) => {
+        const request = indexedDB.open("star5-share", 1);
+        request.onupgradeneeded = () => request.result.createObjectStore("inbox", {keyPath: "id", autoIncrement: true});
+        request.onerror = () => reject(request.error || new Error("share database"));
+        request.onsuccess = () => {
+          const db = request.result, tx = db.transaction("inbox", "readwrite"), store = tx.objectStore("inbox");
+          const get = store.getAll();
+          let result = [];
+          get.onsuccess = () => {
+            result = get.result;
+            store.clear();
+          };
+          get.onerror = () => { db.close(); reject(get.error || new Error("share read")); };
+          tx.oncomplete = () => { db.close(); resolve(result); };
+          tx.onabort = tx.onerror = () => { db.close(); reject(tx.error || new Error("share import")); };
+        };
+      });
+      const share = entries.filter(entry => Date.now() - entry.created < 10 * 60 * 1000)
+        .sort((a, b) => a.created - b.created).at(-1);
+      if (!share) { banner(T.sharedMissing); return; }
+      const parts = [...new Set([share.title, share.text, share.url].map(value => String(value || "").trim()).filter(Boolean))];
+      let question = parts.join("\n").slice(0, 2000);
+      const files = (share.files || []).map(file =>
+        new File([file], file.name || "file", {type: file.type || "", lastModified: file.lastModified || Date.now()}));
+      if (!question && files.length) question = T.sharedFileQuestion;
+      if (!question && !files.length) { banner(T.sharedMissing); return; }
+      if (location.hash !== "#/") location.hash = "#/";
+      const input = $("#q");
+      input.value = question; autosize(input);
+      if (files.length) state.homeComposer.add(files);
+      banner(share.fileError ? T.sharedFilesMissing
+        : share.fileCount > files.length ? T.tooMany(10) : T.sharedReady);
+      input.focus();
+    } catch (error) {
+      console.error("Could not import shared content", error);
+      banner(T.sharedImportError);
+    }
+  }
+
   function renderAttachments(row, turn) {
     row.replaceChildren();
     (turn.attachments || []).forEach(a => {
@@ -1355,6 +1398,7 @@
     }).catch(syncSites);
     loadLibrary();
     route();
+    importSharedContent();
     setInterval(() => { if (state.threads.some(t => t.status === "running" || t.status === "queued")) loadLibrary(); }, 20000);
   }
   init();
