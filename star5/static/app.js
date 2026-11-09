@@ -218,6 +218,7 @@
   function openLibrary() {
     state.libLimit = Math.max(state.libLimit, 40); renderLibrary();
     if (matchMedia("(max-width:860px)").matches) { document.body.classList.add("menu"); $("#scrim").hidden = false; }
+    else if (document.body.classList.contains("side-off")) $("#sideClose").click();
     $("#libFilter").focus();
   }
 
@@ -1386,9 +1387,20 @@
     $("#uiLang").addEventListener("change", e => { state.ui = e.target.value; store.set("s5.ui", state.ui); applyI18n(); });
     $("#libFilter").addEventListener("input", renderLibrary);
     $("#recentAll").addEventListener("click", openLibrary);
+    const narrow = () => matchMedia("(max-width:860px)").matches;
+    const setSideOff = off => {
+      document.body.classList.toggle("side-off", off); store.set("s5.sideOff", off ? "1" : "0"); scheduleRail();
+      const b = $("#sideClose"); b.dataset.i18nTitle = off ? "showSide" : "hideSide";
+      if (T) { b.title = T[b.dataset.i18nTitle]; b.setAttribute("aria-label", b.title); }
+    };
+    setSideOff(store.get("s5.sideOff", "0") === "1");
     $("#menuBtn").addEventListener("click", () => { document.body.classList.add("menu"); $("#scrim").hidden = false; });
     const closeMenu = () => { document.body.classList.remove("menu"); $("#scrim").hidden = true; };
-    $("#scrim").addEventListener("click", closeMenu); $("#sideClose").addEventListener("click", closeMenu);
+    $("#scrim").addEventListener("click", closeMenu);
+    $("#sideClose").addEventListener("click", () => {
+      if (narrow()) closeMenu(); else setSideOff(!document.body.classList.contains("side-off"));
+    });
+    $("#libBtn").addEventListener("click", openLibrary);
     $("#newBtn").addEventListener("click", () => { if (location.hash === "#/" || !location.hash) route(); });
     window.addEventListener("hashchange", route);
     applyI18n();

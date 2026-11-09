@@ -2,7 +2,7 @@
 window.I18N = {
   it: {
     new: "Nuova ricerca", library: "Cronologia", searchLib: "Cerca nella cronologia", noThreads: "Nessuna ricerca ancora",
-    uiLanguage: "Lingua dell'interfaccia", menu: "Menu", close: "Chiudi",
+    uiLanguage: "Lingua dell'interfaccia", menu: "Menu", close: "Chiudi", hideSide: "Nascondi la barra laterale", showSide: "Mostra la barra laterale",
     hero: "Cosa vuoi sapere?", placeholder: "Chiedi qualsiasi cosa…", search: "Cerca", send: "Invia", mode: "Modalità",
     options: "Opzioni", answerLang: "Lingua della risposta", tone: "Stile", effort: "Ragionamento", effortAuto: "Automatico (consigliato)", efforts: {low: "Basso", medium: "Medio", high: "Alto", xhigh: "Molto alto", max: "Massimo"}, sites: "Siti letti per ogni ricerca",
     langAuto: "Automatica (lingua della domanda)",
@@ -73,7 +73,7 @@ window.I18N = {
   },
   fr: {
     new: "Nouvelle recherche", library: "Historique", searchLib: "Rechercher dans l'historique", noThreads: "Aucune recherche pour l'instant",
-    uiLanguage: "Langue de l'interface", menu: "Menu", close: "Fermer",
+    uiLanguage: "Langue de l'interface", menu: "Menu", close: "Fermer", hideSide: "Masquer la barre latérale", showSide: "Afficher la barre latérale",
     hero: "Que voulez-vous savoir ?", placeholder: "Posez n'importe quelle question…", search: "Rechercher", send: "Envoyer", mode: "Mode",
     options: "Options", answerLang: "Langue de la réponse", tone: "Style", effort: "Raisonnement", effortAuto: "Automatique (recommandé)", efforts: {low: "Faible", medium: "Moyen", high: "Élevé", xhigh: "Très élevé", max: "Maximum"}, sites: "Sites lus par recherche",
     langAuto: "Automatique (langue de la question)",
@@ -144,7 +144,7 @@ window.I18N = {
   },
   en: {
     new: "New search", library: "History", searchLib: "Search history", noThreads: "No searches yet",
-    uiLanguage: "Interface language", menu: "Menu", close: "Close",
+    uiLanguage: "Interface language", menu: "Menu", close: "Close", hideSide: "Hide sidebar", showSide: "Show sidebar",
     hero: "What do you want to know?", placeholder: "Ask anything…", search: "Search", send: "Send", mode: "Mode",
     options: "Options", answerLang: "Answer language", tone: "Style", effort: "Reasoning", effortAuto: "Automatic (recommended)", efforts: {low: "Low", medium: "Medium", high: "High", xhigh: "Very high", max: "Maximum"}, sites: "Sites read per search",
     langAuto: "Automatic (question language)",
