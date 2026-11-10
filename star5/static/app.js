@@ -223,6 +223,24 @@
   }
 
   /* ---------- views ---------- */
+  /* The portal's star menu (/_star5/menu.js) is a fixed button in the bottom-right corner, where on phones it
+     covered the follow-up composer's send button: dock it in the mobile header instead. */
+  function dockStarMenu() {
+    const dock = host => {
+      if (!host?.shadowRoot || host.shadowRoot.querySelector("style[data-s5]")) return;
+      const css = document.createElement("style"); css.dataset.s5 = "";
+      css.textContent = "@media (max-width:860px){.fab{top:calc(env(safe-area-inset-top) + 6px);bottom:auto;right:8px;width:40px;height:40px}}";
+      host.shadowRoot.appendChild(css); document.body.classList.add("has-star");
+    };
+    const found = document.getElementById("star5-menu");
+    if (found) return dock(found);
+    const obs = new MutationObserver(() => {
+      const host = document.getElementById("star5-menu");
+      if (host) { obs.disconnect(); dock(host); }
+    });
+    obs.observe(document.body, {childList: true});
+    setTimeout(() => obs.disconnect(), 30000);
+  }
   function show(view) {
     ["home", "thread", "missing"].forEach(id => { $(`#${id}`).hidden = id !== view; });
     if (view !== "thread") { $("#rail").hidden = true; $("#toBottom").hidden = true; }
@@ -1401,6 +1419,7 @@
       if (narrow()) closeMenu(); else setSideOff(!document.body.classList.contains("side-off"));
     });
     $("#libBtn").addEventListener("click", openLibrary);
+    dockStarMenu();
     $("#newBtn").addEventListener("click", () => { if (location.hash === "#/" || !location.hash) route(); });
     window.addEventListener("hashchange", route);
     applyI18n();

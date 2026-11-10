@@ -371,6 +371,8 @@ button{cursor:pointer}
   .only-mobile{display:inline-flex}
   .only-desktop{display:none}
   .mtop{display:flex}
+  body.has-star .mtop{padding-right:52px}
+  body.menu #star5-menu{display:none}
   .home{justify-content:flex-start;padding-top:8vh}
   .recent{margin-top:24px}
   .recent-list{grid-template-columns:1fr}
