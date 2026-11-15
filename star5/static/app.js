@@ -54,7 +54,7 @@
     excludeTrailingPunctuationFromURLs: true, ghCodeBlocks: true, tasklists: true, noHeaderId: true});
 
   /* ---------- API ---------- */
-  async function api(path, {method = "GET", body} = {}) {
+  async function api(path, {method = "GET", body, quiet = false} = {}) {
     const headers = {"Accept": "application/json"};
     if (method !== "GET") headers["X-Star5"] = "1";
     if (body !== undefined) headers["Content-Type"] = "application/json";
@@ -62,7 +62,7 @@
     try {
       res = await fetch(path, {method, headers, body: body === undefined ? undefined : JSON.stringify(body),
         credentials: "same-origin", redirect: "manual", cache: "no-store"});
-    } catch (error) { banner(T.offline); throw error; }
+    } catch (error) { if (!quiet) banner(T.offline); throw error; }
     if (res.type === "opaqueredirect" || res.status === 401 || res.status === 302) { expired(); throw new Error("expired"); }
     if (!res.ok) {
       let detail = "";
@@ -145,9 +145,30 @@
 
   /* ---------- library (sidebar) and recent searches (home) ---------- */
   const LIB_STEP = 8, RECENT = 6;
-  async function loadLibrary() {
-    try { state.threads = (await api("/api/s5/threads")).threads; } catch { return; }
-    renderLibrary(); renderRecent();
+  let libSig = "", libAt = 0;
+  async function loadLibrary(quiet = false) {
+    libAt = Date.now();
+    let threads;
+    try { threads = (await api("/api/s5/threads", {quiet})).threads; } catch { return; }
+    const sig = JSON.stringify(threads);
+    state.threads = threads;
+    if (quiet && sig === libSig) return;
+    libSig = sig; renderLibrary(); renderRecent();
+  }
+  // Searches started on another device: refresh on return to the page, then poll only while visible.
+  function pollLibrary(minAge) {
+    if (document.hidden || state.expired || Date.now() - libAt < minAge) return;
+    loadLibrary(true);
+  }
+  function watchLibrary() {
+    const back = () => pollLibrary(5000);
+    document.addEventListener("visibilitychange", back);
+    window.addEventListener("focus", back);
+    window.addEventListener("online", back);
+    setInterval(() => {
+      const busy = state.threads.some(t => t.status === "running" || t.status === "queued");
+      pollLibrary(busy ? 14000 : 59000);
+    }, 15000);
   }
   function dayGroup(t) {
     const now = new Date(), day = 86400000, ms = t.updated * 1000;
@@ -1430,7 +1451,7 @@
     loadLibrary();
     route();
     importSharedContent();
-    setInterval(() => { if (state.threads.some(t => t.status === "running" || t.status === "queued")) loadLibrary(); }, 20000);
+    watchLibrary();
   }
   init();
 })();
